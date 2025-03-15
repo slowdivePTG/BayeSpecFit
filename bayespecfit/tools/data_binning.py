@@ -1,5 +1,6 @@
-import numpy as np
+# bayespecfit/tools/data_binning.py
 
+import numpy as np
 
 def data_binning(
     data, size=2, min_bin=1, spec_resolution=0, sigma_clip=3

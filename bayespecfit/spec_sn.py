@@ -1,4 +1,4 @@
-# sn_line_vel/spec_sn.py
+# bayespecfit/spec_sn.py
 
 import pandas as pd
 import numpy as np

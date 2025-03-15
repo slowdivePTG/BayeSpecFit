@@ -1,4 +1,4 @@
-# sn_line_vel/spec_line.py
+# bayespecfit/spec_line.py
 
 from scipy.optimize import minimize
 import numpy as np

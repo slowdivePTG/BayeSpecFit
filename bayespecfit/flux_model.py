@@ -1,3 +1,5 @@
+# bayespecfit/flux_model.py
+
 ###################### conversion between wav and vel ##########################
 
 import numpy as np

@@ -1,4 +1,4 @@
-# __init__.py
+# bayespecfit/__init__.py
 
 __all__ = ["SpectrumSN"]
 
