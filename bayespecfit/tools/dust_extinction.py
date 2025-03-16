@@ -3,6 +3,8 @@
 import numpy as np
 from scipy import interpolate
 
+from numpy.typing import ArrayLike
+
 
 def fm90(wv, c1, c2, c3, c4, x0, gamma):
     """
@@ -71,7 +73,7 @@ def ftz(wv, RV):
     return np.piecewise(wv, [wv < 2700, wv >= 2700], [UVFunc, OptIRFunc])
 
 
-def calALambda(wv, RV, EBV, model="ftz"):
+def calALambda(wv: ArrayLike, RV: float, EBV: float, model: str = "ftz") -> ArrayLike:
     """
     Calculate A(lambda)
     Input:

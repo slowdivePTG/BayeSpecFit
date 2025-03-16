@@ -1,17 +1,19 @@
 # bayespecfit/tools/data_binning.py
 
 import numpy as np
+from numpy.typing import ArrayLike
+
 
 def data_binning(
-    data, size=2, min_bin=1, spec_resolution=0, sigma_clip=3
-):  # size - Angstrom
+    data: ArrayLike, size: int, min_bin: int = 1, spec_resolution: float = 0, sigma_clip: float = 3
+) -> ArrayLike:
     """
     binning spectroscopic data with a finite spectral resolution (FWHM)
     within the FWHM, the noise is expected to be correlated
 
     data : array_like
         np.array([[wavelength], [flux], [flux_err]]).T
-    size : float, default = 2
+    size : float
         bin size in same units as that of the wavelength
     min_bin : int, default = 1
         minimum number of data points with a bin
@@ -37,30 +39,30 @@ def data_binning(
         if len(temp) >= min_bin:
             if len(temp) > 1:  # if there are more than 1 data points in the bin
                 arg = np.arange(len(temp))
-                X, Y, Yerr = (
+                x, y, yerr = (
                     temp[arg, 0].reshape(-1, 1),
                     temp[arg, 1].reshape(-1, 1),
                     temp[arg, 2].reshape(-1, 1),
                 )
                 if sigma_clip != None:
-                    clip = np.abs(Y - np.median(Y)) <= sigma_clip * mad_std(Y)
-                    X, Y, Yerr = X[clip], Y[clip], Yerr[clip]
+                    clip = np.abs(y - np.median(y)) <= sigma_clip * mad_std(y)
+                    x, y, yerr = x[clip], y[clip], yerr[clip]
 
-                # mu = weight^T * Y
+                # mu = weight^T * y
                 # var = weight^T * Cov * weight
-                weight = Yerr ** (-2.0) / (Yerr ** (-2.0)).sum()
+                weight = yerr ** (-2.0) / (yerr ** (-2.0)).sum()
 
                 if spec_resolution > 0:
-                    X_A = np.repeat(X, len(X)).reshape(len(X), len(X))
+                    X_A = np.repeat(x, len(x)).reshape(len(x), len(x))
                     X_B = X_A.T
                     rho = np.exp(
                         -((X_A - X_B) ** 2) / (2 * (spec_resolution / 2.355) ** 2)
-                    ) # correlation coefficient = exp(-r^2/2 sigma^2)
-                    cov = rho * np.outer(Yerr, Yerr)
+                    )  # correlation coefficient = exp(-r^2/2 sigma^2)
+                    cov = rho * np.outer(yerr, yerr)
                 else:
-                    cov = np.diag(Yerr.flatten() ** 2)
-                X_bin = X.mean()
-                Y_bin = weight.T @ Y
+                    cov = np.diag(yerr.flatten() ** 2)
+                X_bin = x.mean()
+                Y_bin = weight.T @ y
                 Yerr_bin = (weight.T @ cov @ weight) ** 0.5
                 i = j
             else:  # if there is only 1 data point in the bin
@@ -76,7 +78,7 @@ def data_binning(
     return np.array(data_bin)
 
 
-def plot_box_spec(wave, flux):
+def plot_box_spec(wave: ArrayLike, flux: ArrayLike) -> ArrayLike:
     flux_plot = np.repeat(flux, 2)
     wv_plot = wave.copy()
     wv_plot[:-1] += np.diff(wave) / 2

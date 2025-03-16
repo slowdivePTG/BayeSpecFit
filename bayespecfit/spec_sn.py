@@ -9,10 +9,13 @@ from .tools.dust_extinction import calALambda
 
 from ._utils import plt
 
+from numpy.typing import ArrayLike
+from typing import Optional
+
 ##################### SpectrumSN class ##########################
 
 
-class SpectrumSN(object):
+class SpectrumSN:
     """1D optical spectrum
 
     Attributes
@@ -29,7 +32,7 @@ class SpectrumSN(object):
         uncertainty in flux (in arbitrary units)
 
     line : dict
-        a dictionary of various lines (AbsorbLine objects)
+        a dictionary of various lines (SpecLine objects)
 
     Methods
     -------
@@ -44,7 +47,13 @@ class SpectrumSN(object):
     """
 
     def __init__(
-        self, spec1D, z=0, ebv=0, snr=None, spec_resolution=5, force_pos_flux=False
+        self,
+        spec1D: str,
+        z: float = 0,
+        ebv: float = 0,
+        snr: Optional[float] = None,
+        spec_resolution: Optional[float] = None,
+        force_pos_flux: bool = False,
     ):
         """Constructor
 
@@ -80,7 +89,7 @@ class SpectrumSN(object):
 
         if snr == None:
             try:
-                fl_unc = spec_df[2].values  # * 10 ** (0.4 * ALambda)
+                fl_unc = spec_df[2].values * 10 ** (0.4 * ALambda)
             except:
                 warnings.warn("No flux uncertainty in the datafile!")
                 warnings.warn(f"Please assign the S/N manually.")
@@ -90,11 +99,7 @@ class SpectrumSN(object):
             fl_unc = (
                 np.ones_like(fl)
                 * (np.nanmedian(fl) / snr)
-                * (
-                    np.where(fl > np.nanmedian(fl) / 10, fl, np.nanmedian(fl) / 10)
-                    / np.nanmedian(fl)
-                )
-                ** -0.5
+                * (np.where(fl > np.nanmedian(fl) / 10, fl, np.nanmedian(fl) / 10) / np.nanmedian(fl)) ** -0.5
             )
 
         # make sure flux measurements are positive
@@ -104,21 +109,25 @@ class SpectrumSN(object):
         self.fl_unc = fl_unc[pos_flux]
 
         # self.snr = snr
-        self.spec_resolution = spec_resolution
+        if spec_resolution == None:
+            warnings.warn("The spectral resolution is not provided: assume infinite resolution.")
+            self.spec_resolution = 0
+        else:
+            self.spec_resolution = spec_resolution
 
-        self.line = {}
+        self.line: dict[str, SpecLine] = {}
 
     def add_line(
         self,
-        name,
-        blue_edge,
-        red_edge,
-        lines=[],
-        rel_strength=[],
-        free_rel_strength=[],
-        line_model="Gauss",
-        mask=[],
-        plot_region=False,
+        name: str,
+        lines: list[list[float]] | list[float],
+        line_regions: list[tuple[float, float]],
+        lines_id: Optional[list[int]] = None,
+        rel_strength: Optional[list[list[float]] | list[float]] = None,
+        free_rel_strength: Optional[list[bool]] = None,
+        line_model: str = "Gauss",
+        mask: Optional[list[tuple, tuple]] = None,
+        plot_region: bool = False,
     ):
         """Add one (series of) absorption line(s)
 
@@ -129,35 +138,46 @@ class SpectrumSN(object):
         name : str
             the name of the absorption line
 
-        blue_edge, red_edge : float
-            the wavelength [angstrom] (host galaxy frame) at
-            the blue/red edge
-
-        lines : 2D array_like, default=[]
+        lines : list
             wavelength of each absorption line
 
-        rel_strength : array_like, default=[]
-            the relative strength between each line in the series
-            rel_strength = []: all lines are of the equal strength
+        line_regions : list
+            the blue and red edges of each line region to fit
 
-        free_rel_strength : array_like, default=[]
+        lines_id : list, default=None
+            the ID of each line in the series
+
+        rel_strength : list, default=None
+            the relative strength between each line in the series
+            default: all lines are of the equal strength
+
+        free_rel_strength : array_like, default=None
             whether to set the relative strength of each line series as
             another free parameter in MCMC fit
+
+        line_model : str, default="Gauss"
+            the line profile model: "Gauss" or "Lorentzian"
+
+        mask : list, default=None
+            the mask to exclude certain regions in the line fitting
+
+        plot_region : bool, default=False
+            whether to plot the line region
         """
 
         self.line[name] = SpecLine(
             np.array([self.wv_rf, self.fl, self.fl_unc]).T,
-            spec_resolution=self.spec_resolution,
-            blue_edge=blue_edge,
-            red_edge=red_edge,
             lines=lines,
+            line_regions=line_regions,
+            lines_id=lines_id,
             rel_strength=rel_strength,
             free_rel_strength=free_rel_strength,
             line_model=line_model,
+            spec_resolution=self.spec_resolution,
             mask=mask,
         )
         if plot_region:
-            self.plot_line_region(blue_edge=blue_edge, red_edge=red_edge)
+            self.plot_line_region(line_regions)
             plt.show()
 
     def plot_line_region(self, blue_edge, red_edge):

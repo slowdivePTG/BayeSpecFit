@@ -9,71 +9,15 @@ from .flux_model import velocity_rf, calc_model_flux
 
 from ._utils import plt
 
+from numpy.typing import ArrayLike
+from typing import Optional
+from matplotlib.axes import Axes
 
-class SpecLine(object):
-    """A (series of) absorption line(s) in a 1D optical spectrum
+SPEED_OF_LIGHT = 2.99792458e5
 
-    Attributes
-    ----------
 
-    wv_line : array_like
-        the wavelength range [angstrom] of the line
-        (host galaxy frame)
-
-    rel_strength : array_like, default=[]
-        the relative strength between each line in the series
-        rel_strength = []: all lines are of the equal strength
-
-    free_rel_strength : array_like, default=[]
-        whether to set the relative strength of each line series as
-        another free parameter in MCMC fit
-
-    lambda_0 : float
-        wavelength as a reference for velocity
-
-    norm_fl : array_like
-        flux normalized by the median value within the line region
-
-    norm_fl_unc : array_like
-        normalized flux uncertainty within the line region
-
-    blue_fl, red_fl : list
-        normalized flux and uncertainty at the blue/red edge
-
-    vel_rf : array_like
-        relative velocities of each point with respect
-        to the center of absorption
-
-    blue_vel, red_vel : float
-        relative velocity at the blue/red edge
-
-    lines : 2D array_like, default=[]
-            wavelength of each absorption line
-
-    theta_LS : array_like
-        best fit with least square methods, powered by
-        scipy.optimize.minimize()
-
-    neg_lnL_LS : float
-        the minimized negative log-likelihood with least square methods
-
-    chi2_MCMC : float
-        the minimized residual with MCMC
-
-    theta_MCMC : array_like
-        best fit with an MCMC sampler, approximated by median
-        values in the MCMC chains
-
-    sig_theta_MCMC : array_like
-        1 sigma uncertainty for each parameter, approximated
-        by the half the range of 16 and 84 percentile values
-        in the MCMC chains
-
-    EW : float
-        effective width [angstrom]
-
-    sig_EW : float
-        uncertainty in effective width [angstrom]
+class SpecLine:
+    """amp (series of) absorption line(s) in a 1D optical spectrum
 
     Methods
     -------
@@ -82,7 +26,7 @@ class SpecLine(object):
 
     MCMC_sampler(vel_mean_mu=[], vel_mean_sig=[],
                  vel_var_lim=[2e1, 1e8],
-                 A_lim=[-1e5, 1e5],
+                 amp_lim=[-1e5, 1e5],
                  sampler='NUTS',
                  nburn=2000,
                  target_accept=0.8,
@@ -99,40 +43,43 @@ class SpecLine(object):
 
     def __init__(
         self,
-        spec,
-        spec_resolution,
-        blue_edge=-np.inf,
-        red_edge=np.inf,
-        lines=[],
-        rel_strength=[],
-        free_rel_strength=[],
-        line_model="Gauss",
-        mask=[],
+        spec: ArrayLike,
+        lines: list[list[float]] | list[float],
+        line_regions: list[tuple[float, float]] | tuple[float, float],
+        lines_id: Optional[list[str]] = None,
+        rel_strength: Optional[list[list[float]] | list[float]] = None,
+        free_rel_strength: Optional[list[bool]] = None,
+        line_model: str = "Gauss",
+        mask: Optional[list[tuple, tuple]] = None,
+        spec_resolution: float = 0,
     ):
         """Constructor
 
         Parameters
         ----------
-        spec: array-like
-            [wv_rf, fl, fl_unc]
+        spec: ArrayLike, shape=(n, 3)
+            [wavelength in the host galaxy rest frame, flux, flux_uncertainty]
 
         z: float, default=0
             host galaxy redshift
 
-        blue_edge, red_edge: float
-            the wavelength [angstrom] (host galaxy frame) at the blue/red edge
-
-        lines: 2D array_like, default=[]
+        lines: list[list[float]] | list[float]
             the central wavelength(s) [angstrom] of this (series) of line(s)
-            1D/2D for single components:
-                Si II: [[6371.359, 6347.103]] or [6371.359, 6347.103]
-            2D for multiple components":
-                different vel components of one element:
-                    Ca II IRT [[8498.018, 8542.089, 8662.140], [8498.018, 8542.089, 8662.140]]
-                multiple elements:
-                    He I/Fe II [[10830], [9998, 10500, 10863]]
+                1D/2D for single components:
+                    Si II: [[6371.359, 6347.103]] or [6371.359, 6347.103]
+                2D for multiple components":
+                    different vel components of one element:
+                        Ca II IRT [[8498.018, 8542.089, 8662.140], [8498.018, 8542.089, 8662.140]]
+                    multiple elements:
+                        He I/Fe II [[10830], [9998, 10500, 10863]]
 
-        rel_strength : 2D array_like, default=[]
+        line_regions: list[tuple[float, float]] | tuple[float, float]
+            the blue and red edges [angstrom] of each line region to fit
+
+        lines_id : list[str], optional
+            the name of each line component
+
+        rel_strength : 2D array_like, optional
             the relative strength between each line in the series
             1D/2D for single component:
                 Si II: [] or [[]] - empty for equal strength
@@ -147,115 +94,133 @@ class SpecLine(object):
         line_model : string
             ["Gauss", "Lorentz"]
 
-        mask : array of tuples, default=[]
-            line regions to be masked in the fit
+        mask : list[tuple], optional
+            line regions to be excluded in the fitting
         """
 
-        # if bin:
-        #     print("binning spectrum...")
-        #     dat = data_binning(spec, size=bin_size, spec_resolution=spec_resolution)
-        # else:
-        dat = spec
-        self.wv_rf, self.fl, self.fl_unc = dat[:, 0], dat[:, 1], dat[:, 2]
-        self.spec_resolution = spec_resolution
+        self.wv_rf, self.fl, self.fl_unc = spec[:, 0], spec[:, 1], spec[:, 2]
         self.line_model = line_model
 
+        ##################### Initialize the flux data ######################
         # line region
-        line_region = (self.wv_rf < red_edge) & (self.wv_rf > blue_edge)
-        self.wv_line = self.wv_rf[line_region]
+        in_line_region = np.zeros_like(self.wv_rf, dtype=bool)
+        for edge in line_regions:
+            in_line_region |= (self.wv_rf > edge[0]) & (self.wv_rf < edge[1])
+        self.line_regions = line_regions
+        wv_line = self.wv_rf[in_line_region]
+
+        # exclude masked regions
+        in_unmasked_region = np.ones_like(wv_line, dtype=bool)
+        if mask is not None:
+            for mk in mask:
+                in_unmasked_region &= (wv_line < mk[0]) | (wv_line > mk[1])
+            self.mask = mask
+        else:
+            self.mask = []
+
+        self.wv_line = wv_line[in_unmasked_region]
+        self.wv_line_unmasked = wv_line
 
         # normalized flux
-        norm_fl = self.fl[line_region] / np.nanmedian(self.fl[line_region])
-        norm_fl_unc = self.fl_unc[line_region] / np.nanmedian(self.fl[line_region])
+        self._fl_med = np.nanmedian(self.fl[in_line_region][in_unmasked_region])
+        fl_norm = self.fl[in_line_region] / self._fl_med
+        fl_norm_unc = self.fl_unc[in_line_region] / self._fl_med
 
         # check if there are points with relative uncertainty
         # two orders of magnitude lower than the median
-        rel_unc = norm_fl_unc / norm_fl
+        rel_unc = fl_norm_unc / fl_norm
         med_rel_unc = np.nanmedian(rel_unc)
         if rel_unc.min() < med_rel_unc / 1e2:
             warnings.warn("Some flux with extremely low uncertainty!")
+            rel_unc[rel_unc < med_rel_unc / 1e2] = med_rel_unc
             warnings.warn("New uncertainty assigned!")
-        rel_unc[rel_unc < med_rel_unc / 1e2] = med_rel_unc
-        norm_fl_unc = rel_unc * norm_fl
 
-        # mask certain regions
-        self.mask = mask
-        line_region_masked = np.ones_like(self.wv_line, dtype=bool)
-        for mk in mask:
-            line_region_masked &= (self.wv_line < mk[0]) | (self.wv_line > mk[1])
-        self.wv_line_masked = self.wv_line[line_region_masked]
+        fl_norm_unc = rel_unc * fl_norm
 
-        self.norm_fl = norm_fl[line_region_masked]
-        self.norm_fl_unmasked = norm_fl
+        self.fl_norm = fl_norm[in_unmasked_region]
+        self.fl_norm_unmasked = fl_norm
 
-        self.norm_fl_unc = norm_fl_unc[line_region_masked]
-        self.norm_fl_unc_unmasked = norm_fl_unc
+        self.fl_norm_unc = fl_norm_unc[in_unmasked_region]
+        self.fl_norm_unc_unmasked = fl_norm_unc
 
-        # calculate the covariance matrix & its determinant
-        # wv_A = np.repeat(self.wv_line_masked, len(self.wv_line_masked)).reshape(
-        #     len(self.wv_line_masked), -1
-        # )
-        # wv_B = wv_A.T
-        # if self.spec_resolution > 0:
-        #     rho = np.exp(
-        #         -((wv_A - wv_B) ** 2) / (2 * (self.spec_resolution / 2.355 / 2) ** 2)
-        #     )
-        # else:
-        #     rho = np.diag(np.ones_like(self.norm_fl_unc))
-        # self.norm_fl_cov = np.outer(self.norm_fl_unc, self.norm_fl_unc) * rho
+        # specify the spectral resolution in each line region
+        # if not provided, assume infinite resolution
+        if isinstance(spec_resolution, (int, float)):
+            self.spec_resolution = np.ones(len(self.line_regions)) * spec_resolution
+        else:
+            self.spec_resolution = spec_resolution
+        # spectral resolution to velocity resolution
+        self.vel_resolution = []
+        # estimated flux at each edge (used as the initial guess & prior)
+        self.blue_fl, self.red_fl = [], []
+        for edge, spec_res in zip(self.line_regions, self.spec_resolution):
+            vel_res = SPEED_OF_LIGHT * spec_res / 2.355 / ((edge[0] + edge[1]) / 2)
+            print(f"Spec. resolution for line region {edge}: {vel_res:.0f} km/s")
+            self.vel_resolution.append(vel_res)
 
-        # flux at each edge
-        range_l = red_edge - blue_edge
-        delta_l = min(self.spec_resolution * 3, range_l / 10)
-        blue_fl = self.get_flux_at_lambda(blue_edge, delta_l=delta_l)
-        red_fl = self.get_flux_at_lambda(red_edge, delta_l=delta_l)
-        self.blue_fl = blue_fl / np.nanmedian(self.fl[line_region])
-        self.red_fl = red_fl / np.nanmedian(self.fl[line_region])
+            range_l = edge[1] - edge[0]
+            delta_l = min(spec_res * 3, range_l / 10)
+            self.blue_fl.append(self.get_flux_at_lambda(edge[0], delta_l=delta_l) / self._fl_med)
+            self.red_fl.append(self.get_flux_at_lambda(edge[1], delta_l=delta_l) / self._fl_med)
 
-        # velocity
-        try:
-            if len(lines[0]) > 0:
-                pass
-        except:
-            lines = np.atleast_2d(lines)
-            rel_strength = np.atleast_2d(rel_strength)
+        ################ Initialize the absorption lines #####################
+        # if only one line is provided and the input is a 1D list
+        if isinstance(lines[0], (int, float)):
+            lines = [lines]
 
+        # check if the shapes of lines and rel_strength match
+        if rel_strength is None:
+            rel_strength = [[]] * len(lines)
+        elif isinstance(rel_strength[0], (int, float)):
+            rel_strength = [rel_strength]
+
+        if len(rel_strength) != len(lines):
+            raise IndexError("The number of lines and their relative strength do not match in shape")
+        for k in range(len(lines)):
+            # if rel_strength is not provided, assume equal strength
+            if len(rel_strength[k]) == 0:
+                rel_strength[k] = np.ones_like(lines[k])
+            elif len(lines[k]) != len(rel_strength[k]):
+                raise IndexError("The number of line components and their relative strength do not match in shape")
+
+        # check if the shapes of lines and free_rel_strength match
+        if free_rel_strength is None:
+            free_rel_strength = np.zeros_like(lines, dtype=bool)
+        elif len(free_rel_strength) != len(lines):
+            raise IndexError("The number of lines and the free_rel_strength indicator do not match in shape")
+
+        # reorder the lines based on their relative strength
         self.rel_strength = []
         self.lines = []
 
-        for k in range(len(lines)):
-            if len(rel_strength[k]) == 0:
-                rs = np.ones_like(lines[k])
-            else:
-                rs = rel_strength[k]
-            li = np.array(lines[k])[np.argsort(rs)]
-            rs = np.sort(rs) / np.max(rs)
-            self.lines.append(li)
-            self.rel_strength.append(rs)
+        for li, rs in zip(lines, rel_strength):
+            idx = np.argsort(rs)
+            self.lines.append(np.array(li)[idx])
+            self.rel_strength.append(np.array(rs)[idx] / np.max(rs))
 
-        if len(free_rel_strength) == 0:
-            free_rel_strength = np.array([False] * len(self.rel_strength))
+        if lines_id is None:
+            lines_id = [f"line_{k}" for k in range(len(lines))]
+        elif len(lines_id) != len(lines):
+            raise IndexError(f"The number of lines ({len(lines)}) and their ID ({len(lines_id)}) do not match in shape")
+        self.lines_id = lines_id
+
         self.free_rel_strength = free_rel_strength
 
-        self.lambda_0 = self.lines[0][-1]
-        vel_rf = velocity_rf(self.wv_rf, self.lambda_0)
-        self.vel_rf_unmasked = vel_rf[line_region]
-        self.vel_rf = vel_rf[line_region][line_region_masked]
+        # self.lambda_0 = self.lines[0][-1]
+        # vel_rf = velocity_rf(self.wv_rf, self.lambda_0)
+        # self.vel_rf_unmasked = vel_rf[in_line_region]
+        # self.vel_rf = vel_rf[in_line_region][line_region_masked]
 
-        self.blue_vel = velocity_rf(blue_edge, self.lambda_0)
-        self.red_vel = velocity_rf(red_edge, self.lambda_0)
-
-        self.vel_resolution = (
-            2.99792458e5 * self.spec_resolution / 2.355 / ((blue_edge + red_edge) / 2)
-        )  # spectral resolution in terms of velocity (FWHM = 2.355 sigma for Gaussian dist.)
+        # self.blue_vel = velocity_rf(blue_edge, self.lambda_0)
+        # self.red_vel = velocity_rf(red_edge, self.lambda_0)
 
         self.theta_LS = []
-        self.chi2_LS = np.nan
+        self.chi2_LS = None
 
         self.theta_MCMC = []
         self.sig_theta_MCMC = []
 
-    def LS_estimator(self, guess, plot_model=False):
+    def LS_estimator(self, guess):
         """Least square point estimation
 
         Parameters
@@ -275,27 +240,37 @@ class SpecLine(object):
         )
 
         self.theta_LS = LS_res["x"]
-        ndim = len(self.theta_LS)
         self.neg_lnL_LS = LS_res["fun"]
 
-        ndim = len(self.theta_LS)
-        if plot_model:
-            self.plot_model(self.theta_LS)
+        # plt.scatter(self.wv_line, self.fl_norm, label="data")
+        # plt.scatter(
+        #     self.wv_line,
+        #     calc_model_flux(
+        #         self.theta_LS,
+        #         wv_rf=self.wv_line,
+        #         lines=self.lines,
+        #         rel_strength=self.rel_strength,
+        #         line_regions=self.line_regions,
+        #         vel_resolution=self.vel_resolution,
+        #     ),
+        #     label="model",
+        # )
+        # plt.show()
 
         print("LS estimation:")
-        for k in range(ndim // 3):
-            print("Velocity {}: {:.0f} km/s".format(k + 1, self.theta_LS[2 + 3 * k]))
+        for k in range(len(self.lines)):
+            print("Velocity {}: {:.0f} km/s".format(k + 1, self.theta_LS[2 * len(self.line_regions) + 3 * k]))
         # convert amplitude to equivalent width
-        self.EW = 0
-        for k, rs in enumerate(self.rel_strength):
-            ratio = (
-                np.sum(rs)
-                / (self.red_vel - self.blue_vel)
-                / ((self.red_fl[0] + self.blue_fl[0]) / 2)
-                * (self.wv_line[-1] - self.wv_line[0])
-            )
-            self.EW += self.theta_LS[4 + 3 * k] * -ratio
-        self.sig_EW = np.nan
+        # self.EW = 0
+        # for k, rs in enumerate(self.rel_strength):
+        #     ratio = (
+        #         np.sum(rs)
+        #         / (self.red_vel - self.blue_vel)
+        #         / ((self.red_fl[0] + self.blue_fl[0]) / 2)
+        #         * (self.wv_line[-1] - self.wv_line[0])
+        #     )
+        #     self.EW += self.theta_LS[4 + 3 * k] * -ratio
+        # self.sig_EW = np.nan
 
     def MCMC_sampler(
         self,
@@ -308,14 +283,13 @@ class SpecLine(object):
         ln_vel_sig_diff=[],
         ln_vel_sig_min=[],
         ln_vel_sig_max=[],
-        A_lim=[-1e5, 1e5],
+        amp_lim=[-1e5, 1e5],
         fix_continuum=None,
         sampler="NUTS",
         nburn=2000,
         target_accept=0.8,
         find_MAP=False,
         plot_structure=False,
-        plot_model=True,
         plot_mcmc=False,
     ):
         """MCMC sampler with pymc
@@ -345,11 +319,11 @@ class SpecLine(object):
             if not None, a softplux function will be added the posterior to punish velocity
             dispersions greater than this value
 
-        A_lim : float, default=[-1e5, 1e5]
+        amp_lim : float, default=[-1e5, 1e5]
             allowed range of the amplitude
 
         sampler : ['NUTS', 'MH'], default='NUTS'
-            A step function or collection of functions
+            amp step function or collection of functions
             'NUTS' : The No-U-Turn Sampler
             'MH' : Metropolis–Hastings Sampler
 
@@ -378,6 +352,7 @@ class SpecLine(object):
         ax : matplotlib.axes
             the axes with the plot
         """
+        raise NotImplementedError("This method is not implemented yet")
         import pymc as pm
         import arviz as az
         import corner
@@ -408,7 +383,7 @@ class SpecLine(object):
 
             # Gaussian profile
             # amplitude
-            A = pm.Uniform("A", lower=A_lim[0], upper=A_lim[1], shape=(n_lines,))
+            amp = pm.Uniform("amp", lower=amp_lim[0], upper=amp_lim[1], shape=(n_lines,))
 
             if (len(vel_mean_mu) == n_lines) and (len(ln_vel_sig_mu) == n_lines):
                 # mean velocity
@@ -450,7 +425,7 @@ class SpecLine(object):
             v_sig = pm.Deterministic("v_sig", np.exp(ln_v_sig))
             theta = [fl1, fl2]
             for k in range(n_lines):
-                theta += [v_mean[k], ln_v_sig[k], A[k]]
+                theta += [v_mean[k], ln_v_sig[k], amp[k]]
             # relative intensity of lines
             rel_strength = []
             ratio_index = []
@@ -463,14 +438,14 @@ class SpecLine(object):
                 else:
                     rel_strength.append(self.rel_strength[k])
                 # equivalent width
-                EW_k = pm.Deterministic(
-                    f"EW_{k}",
-                    -A[k]
-                    / (self.red_vel - self.blue_vel)
-                    / ((fl1 + fl2) / 2)
-                    * (self.wv_line[-1] - self.wv_line[0])
-                    * pm.math.sum(rel_strength[k]),
-                )
+                # EW_k = pm.Deterministic(
+                #     f"EW_{k}",
+                #     -amp[k]
+                #     / (self.red_vel - self.blue_vel)
+                #     / ((fl1 + fl2) / 2)
+                #     * (self.wv_line[-1] - self.wv_line[0])
+                #     * pm.math.sum(rel_strength[k]),
+                # )
 
             # flux expectation
             mu = pm.Deterministic(
@@ -489,16 +464,13 @@ class SpecLine(object):
             )
 
             # uncertainty normalization
-            # typical_unc = np.median(self.norm_fl_unc)
+            # typical_unc = np.median(self.fl_norm_unc)
             # sigma_0 = pm.HalfCauchy("sigma_0", beta=typical_unc)
-            # sigma = pm.Deterministic("sigma", (sigma_0**2 + self.norm_fl_unc**2) ** 0.5)
+            # sigma = pm.Deterministic("sigma", (sigma_0**2 + self.fl_norm_unc**2) ** 0.5)
 
-            sigma = self.norm_fl_unc
+            sigma = self.fl_norm_unc
 
-            Flux = pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.norm_fl)
-            # Flux = pm.MvNormal(
-            #     "Flux", mu=mu, cov=self.norm_fl_cov, observed=self.norm_fl
-            # )
+            Flux = pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.fl_norm)
 
         if plot_structure:
             pm.model_to_graphviz(GaussProfile)
@@ -512,7 +484,7 @@ class SpecLine(object):
             start["blue_fl"], start["red_fl"] = self.blue_fl[0], self.red_fl[0]
             start["v_mean"] = initial[2::3]
             start["ln_v_sig"] = initial[3::3]
-            start["A"] = initial[4::3]
+            start["amp"] = initial[4::3]
             # start["sigma_0"] = 1e-3
             for k, free in enumerate(self.free_rel_strength):
                 if free:
@@ -535,7 +507,7 @@ class SpecLine(object):
                     tune=nburn,
                 )
         self.trace = trace
-        var_names_summary = ["v_mean", "v_sig", "A"]  # , "sigma_0"]
+        var_names_summary = ["v_mean", "v_sig", "amp"]  # , "sigma_0"]
         for k in ratio_index:
             var_names_summary.append(f"ratio_{k}")
         for k in range(n_lines):
@@ -561,13 +533,13 @@ class SpecLine(object):
         for k in range(n_lines):
             theta.append(all["mean"][f"v_mean[{k}]"])
             theta.append(all["mean"][f"ln_v_sig[{k}]"])
-            theta.append(all["mean"][f"A[{k}]"])
+            theta.append(all["mean"][f"amp[{k}]"])
             self.EW.append(all["mean"][f"EW_{k}"])
             self.sig_EW.append(all["sd"][f"EW_{k}"])
 
             sig_theta.append(all["sd"][f"v_mean[{k}]"])
             sig_theta.append(all["sd"][f"ln_v_sig[{k}]"])
-            sig_theta.append(all["sd"][f"A[{k}]"])
+            sig_theta.append(all["sd"][f"amp[{k}]"])
         self.theta_MCMC = theta
         self.sig_theta_MCMC = sig_theta
 
@@ -581,7 +553,7 @@ class SpecLine(object):
             for k in range(n_lines):
                 theta_MAP.append(np.array(trace.posterior[f"v_mean"])[ind][k])
                 theta_MAP.append(np.array(trace.posterior[f"ln_v_sig"])[ind][k])
-                theta_MAP.append(np.array(trace.posterior[f"A"])[ind][k])
+                theta_MAP.append(np.array(trace.posterior[f"amp"])[ind][k])
             self.theta_MAP = theta_MAP
 
         if plot_mcmc:
@@ -615,12 +587,13 @@ class SpecLine(object):
 
     def plot_model(
         self,
-        theta,
-        return_ax=False,
-        ax=None,
-        bin=True,
-        bin_size=None,
-    ):
+        theta: list,
+        lambda_0: Optional[float | list[float]] = None,
+        return_ax: bool = False,
+        ax: Optional[Axes | list[Axes]] = None,
+        bin: bool = True,
+        bin_size: Optional[int] = None,
+    ) -> Optional[Axes | list[Axes]]:
         """plot the predicted absorption features
 
         Parameters
@@ -644,131 +617,150 @@ class SpecLine(object):
             wavelength bin size (km s^-1)
         """
 
-        print(f"Lambda_0 : {self.lambda_0} Ang")
+        n_line_regions = len(self.line_regions)
+
+        if lambda_0 is None:
+            warnings.warn("No reference wavelength is provided. Using the red edge of each line region.")
+            lambda_0 = [edge[-1] for edge in self.line_regions]
+        elif isinstance(lambda_0, (int, float)):
+            lambda_0 = [lambda_0]
+        if len(lambda_0) != n_line_regions:
+            raise IndexError(
+                f"The number of reference wavelengths ({len(lambda_0)}) and line regions ({n_line_regions}) do not match"
+            )
 
         if ax == None:
-            _, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
-        # ensure high resolution in predicted model
-        if len(self.vel_rf) < 200:
-            vel_rf = np.linspace(self.vel_rf[0], self.vel_rf[-1], 200)
-        else:
-            vel_rf = self.vel_rf_unmasked
+            _, ax = plt.subplots(1, n_line_regions, figsize=(6 * n_line_regions, 6), constrained_layout=True)
+        ax = np.atleast_1d(ax)
+        if len(ax) != n_line_regions:
+            raise IndexError("The number of axes and line regions do not match")
 
-        # calculate the total flux from multiple lines
-        num = len(self.rel_strength)
-        theta0 = theta[: 2 + 3 * num]
-        j = 2 + 3 * num
-        rel_strength = self.rel_strength.copy()
-        for k, rel in enumerate(self.free_rel_strength):
-            if rel:
-                for rel_s in range(len(rel_strength[k]) - 1):
-                    rel_strength[k][rel_s] = 10 ** theta[j]
-                    j += 1
-        if j != len(theta):
-            raise IndexError("Number of free parameters and relative strength do not match")
+        rel_strength = self.get_rel_strength(theta)
         model_flux = calc_model_flux(
-            theta0,
-            self.vel_resolution,
-            rel_strength,
-            self.lambda_0,
-            self.blue_vel,
-            self.red_vel,
-            vel_rf,
-            self.lines,
+            theta,
+            wv_rf=self.wv_line,
+            lines=self.lines,
+            rel_strength=rel_strength,
+            line_regions=self.line_regions,
+            vel_resolution=self.vel_resolution,
             model=self.line_model,
         )
 
-        # bin the spectrum for visualization purposes
-        spec_plot = np.array([self.vel_rf_unmasked, self.norm_fl_unmasked, self.norm_fl_unc_unmasked]).T
-        if bin:
-            if bin_size == None:
-                bin_size = self.vel_resolution * 2.355
-            print("binning spectrum for visualization...")
-            print(f"bin size: {bin_size:.0f} km/s")
-            spec_plot = data_binning(
-                spec_plot,
-                size=bin_size,
-                spec_resolution=self.vel_resolution,
-                sigma_clip=2,
-            )
-        ax.errorbar(
-            spec_plot[:, 0],
-            spec_plot[:, 1],
-            yerr=spec_plot[:, 2],
-            alpha=0.5,
-            elinewidth=0.5,
-            marker="o",
-            zorder=-100,
-        )
-
-        # residual
-        model_res = (
+        model_flux_elem = [
             calc_model_flux(
-                theta0,
-                self.vel_resolution,
-                rel_strength,
-                self.lambda_0,
-                self.blue_vel,
-                self.red_vel,
-                spec_plot[:, 0],
-                self.lines,
+                np.append(
+                    theta[: 2 * n_line_regions],
+                    theta[2 * n_line_regions + 3 * k : 2 * n_line_regions + 3 * (k + 1)],
+                ),
+                wv_rf=self.wv_line,
+                lines=[self.lines[k]],
+                rel_strength=[rel_strength[k]],
+                line_regions=self.line_regions,
+                vel_resolution=self.vel_resolution,
                 model=self.line_model,
             )
-            - spec_plot[:, 1]
-        )
+            for k in range(len(self.lines))
+        ]
 
-        model_plot = plt.plot(vel_rf, model_flux, linewidth=5, color="k")
-        ax.errorbar(
-            [self.vel_rf_unmasked[0], self.vel_rf_unmasked[-1]],
-            [model_flux[0], model_flux[-1]],
-            yerr=[self.blue_fl[1], self.red_fl[1]],
-            color=model_plot[0].get_color(),
-            fmt="s",
-            markerfacecolor="w",
-            capsize=5,
-        )
-        ax.plot(spec_plot[:, 0], model_res, color="grey")
+        spec = np.array([self.wv_line_unmasked, self.fl_norm_unmasked, self.fl_norm_unc_unmasked]).T
 
-        if len(rel_strength) > 1:
-            colors = [
-                "#66c2a5",
-                "#fc8d62",
-                "#8da0cb",
-                "#e78ac3",
-                "#a6d854",
-                "#ffd92f",
-                "#e5c494",
-            ]
-            for k in range(len(rel_strength)):
-                model_flux = calc_model_flux(
-                    np.append(theta0[:2], theta0[2 + 3 * k : 5 + 3 * k]),
-                    self.vel_resolution,
-                    [rel_strength[k]],
-                    self.lambda_0,
-                    self.blue_vel,
-                    self.red_vel,
-                    self.vel_rf_unmasked,
-                    [self.lines[k]],
+        for k, edges in enumerate(self.line_regions):
+            # trim the spectrum
+            in_line_region = (spec[:, 0] > edges[0]) & (spec[:, 0] < edges[1])
+            spec_plot = spec[in_line_region]
+            vel_rf = velocity_rf(spec_plot[:, 0], lambda_0[k])
+            spec_resolution = self.spec_resolution[k]
+
+            # plot the model
+            model_plot = ax[k].plot(vel_rf, model_flux[in_line_region], linewidth=5, color="k")
+
+            # bin the spectrum for visualization purposes
+            if bin:
+                if bin_size == None:
+                    bin_size = spec_resolution
+                print("binning spectrum for visualization...")
+                print(
+                    f"bin size: {bin_size:.0f} Ang = {bin_size / ((edges[0] + edges[1])/2) * SPEED_OF_LIGHT:.0f} km/s"
+                )
+                spec_plot = data_binning(
+                    spec_plot,
+                    size=bin_size,
+                    spec_resolution=spec_resolution,
+                    sigma_clip=2,
+                )
+
+            vel_rf_plot = velocity_rf(spec_plot[:, 0], lambda_0[k])
+
+            # plot the observations
+            ax[k].errorbar(
+                vel_rf_plot,
+                spec_plot[:, 1],
+                yerr=spec_plot[:, 2],
+                alpha=0.5,
+                elinewidth=0.5,
+                marker="o",
+                zorder=-100,
+            )
+
+            # plot the residuals
+            model_res = (
+                calc_model_flux(
+                    theta,
+                    wv_rf=spec_plot[:, 0],
+                    lines=self.lines,
+                    rel_strength=rel_strength,
+                    line_regions=self.line_regions,
+                    vel_resolution=self.vel_resolution,
                     model=self.line_model,
                 )
-                ax.plot(
-                    self.vel_rf_unmasked,
-                    model_flux,
-                    linewidth=2,
-                    label=f"line_{k}",
-                    color=colors[k % len(colors)],
-                )
-            ax.legend()
+                - spec_plot[:, 1]
+            )
+            ax[k].plot(vel_rf_plot, model_res, color="grey")
 
-        ax.set_xlabel(r"$v\ [\mathrm{km/s}]$")
-        ax.set_ylabel(r"$\mathrm{Normalized\ Flux}$")
+            # plot the edges of the line region
+            ax[k].errorbar(
+                [vel_rf[0], vel_rf[-1]],
+                [theta[2 * k], theta[2 * k + 1]],
+                yerr=[self.blue_fl[k][1], self.red_fl[k][1]],
+                color=model_plot[0].get_color(),
+                fmt="s",
+                markerfacecolor="w",
+                capsize=5,
+            )
+
+            # if there are multiple lines, plot each of them
+            if len(self.lines) > 1:
+                colors_elem = [
+                    "#66c2a5",
+                    "#fc8d62",
+                    "#8da0cb",
+                    "#e78ac3",
+                    "#a6d854",
+                    "#ffd92f",
+                    "#e5c494",
+                ]
+                for l in range(len(self.lines)):
+                    ax[k].plot(
+                        vel_rf,
+                        model_flux_elem[l][in_line_region],
+                        linewidth=2,
+                        label=self.lines_id[l],
+                        color=colors_elem[l % len(colors_elem)],
+                    )
+
+                ax[0].legend()
+
+            ax[k].set_xlabel(r"$v\ [\mathrm{km/s}]$")
+        ax[0].set_ylabel(r"$\mathrm{Normalized\ Flux}$")
 
         # mask
         for mk in self.mask:
-            v_mk_1 = velocity_rf(mk[0], self.lambda_0)
-            v_mk_2 = velocity_rf(mk[1], self.lambda_0)
-            ax.axvspan(v_mk_1, v_mk_2, color="0.8", alpha=0.5)
-        # print(ax.get_ylim())
+            # find out in which line region the mask is
+            idx = int(np.where([mk[0] < edge[1] and mk[1] > edge[0] for edge in self.line_regions])[0][0])
+            v_mk_1 = velocity_rf(mk[0], lambda_0[idx])
+            v_mk_2 = velocity_rf(mk[1], lambda_0[idx])
+            ax[idx].axvspan(v_mk_1, v_mk_2, color="0.8", alpha=0.5)
+
         if return_ax:
             return ax
         else:
@@ -825,20 +817,37 @@ class SpecLine(object):
             repr(e)
             return None, None
 
+    def get_rel_strength(self, theta: list) -> list[list[float]]:
+        """Get the relative strength of the absorption lines"""
+        n_cont = 2 * len(self.line_regions)
+        n_lines = 3 * len(self.lines)
+
+        # update the relative strength if set free
+        rel_strength = self.rel_strength.copy()
+        idx_rel = n_cont + n_lines
+        for k, rel in enumerate(self.free_rel_strength):
+            if rel:
+                for rel_s in range(len(self.rel_strength[k]) - 1):
+                    rel_strength[k][rel_s] = 10 ** theta[idx_rel]
+                    idx_rel += 1
+        if idx_rel != len(theta):
+            raise IndexError(f"Number of free parameters ({len(theta)}) and relative strength ({idx_rel}) do not match")
+        return rel_strength
+
 
 ###################### Likelihood ##########################
 
 
-def lnlike_gaussian_abs(theta, spec_line):
+def lnlike_gaussian_abs(theta, spec_line: SpecLine):
     """Log likelihood function assuming Gaussian profile
 
     Parameters
     ----------
     theta : array_like
-        fitting parameters: flux at the blue edge, flux at the
-        red edge, (mean of relative velocity, log standard deviation,
-        amplitude) * Number of velocity components, log10 line ratio
-        for each velocity components (if set free)
+        fitting parameters:
+            (flux at the blue edge, flux at the red edge) * Number of the line regions,
+            (mean of relative velocity, log standard deviation, amplitude) * Number of velocity components,
+            log10 line ratio for each velocity components (if set free)
 
     spec_line : sn_line_vel.SpecLine.SpecLine
         the SpecLine object
@@ -849,34 +858,26 @@ def lnlike_gaussian_abs(theta, spec_line):
         the log likelihood function
     """
 
-    rel_strength = spec_line.rel_strength.copy()
-    num = len(rel_strength)
-    theta0 = theta[: 2 + 3 * num]
-    j = 2 + 3 * num
-    for k, rel in enumerate(spec_line.free_rel_strength):
-        if rel:
-            for rel_s in range(len(spec_line.rel_strength[k]) - 1):
-                rel_strength[k][rel_s] = 10 ** theta[j]
-                j += 1
-    if j != len(theta):
-        print(j, theta)
-        raise IndexError("Number of free parameters and relative strength do not match")
+    n_cont = 2 * len(spec_line.line_regions)
+    n_lines = 3 * len(spec_line.lines)
+
+    theta0 = theta[: n_cont + n_lines]
+
+    rel_strength = spec_line.get_rel_strength(theta)
 
     model_flux = calc_model_flux(
         theta0,
-        vel_resolution=spec_line.vel_resolution,
-        rel_strength=spec_line.rel_strength,
-        lambda_0=spec_line.lambda_0,
-        blue_vel=spec_line.blue_vel,
-        red_vel=spec_line.red_vel,
-        vel_rf=spec_line.vel_rf,
+        wv_rf=spec_line.wv_line,
         lines=spec_line.lines,
+        rel_strength=rel_strength,
+        line_regions=spec_line.line_regions,
+        vel_resolution=spec_line.vel_resolution,
         model=spec_line.line_model,
     )
     lnl = (
         -0.5 * len(model_flux) * np.log(2 * np.pi)
-        - np.sum(np.log(spec_line.norm_fl_unc))
-        - 0.5 * np.sum((spec_line.norm_fl - model_flux) ** 2 / spec_line.norm_fl_unc**2)
+        - np.sum(np.log(spec_line.fl_norm_unc))
+        - 0.5 * np.sum((spec_line.fl_norm - model_flux) ** 2 / spec_line.fl_norm_unc**2)
     )
 
     return lnl
