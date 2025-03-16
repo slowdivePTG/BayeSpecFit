@@ -225,8 +225,8 @@ class SpecLine:
 
         Parameters
         ----------
-        guess: tuple, default=(1, 1, -10000, 15, -1000)
-            an initial guess for the fitting parameter theta
+        guess: tuple
+            an initial guess for the fitting parameter theta (not including the flux at the blue and red edges)
 
         plot_model : bool, default=False
             whether to plot the best fit result
@@ -239,23 +239,13 @@ class SpecLine:
             args=(self),
         )
 
-        self.theta_LS = LS_res["x"]
-        self.neg_lnL_LS = LS_res["fun"]
+        theta_cont = []
+        for k in range(len(self.line_regions)):
+            theta_cont.append(self.blue_fl[k][0])
+            theta_cont.append(self.red_fl[k][0])
 
-        # plt.scatter(self.wv_line, self.fl_norm, label="data")
-        # plt.scatter(
-        #     self.wv_line,
-        #     calc_model_flux(
-        #         self.theta_LS,
-        #         wv_rf=self.wv_line,
-        #         lines=self.lines,
-        #         rel_strength=self.rel_strength,
-        #         line_regions=self.line_regions,
-        #         vel_resolution=self.vel_resolution,
-        #     ),
-        #     label="model",
-        # )
-        # plt.show()
+        self.theta_LS = np.append(theta_cont, LS_res["x"])
+        self.neg_lnL_LS = LS_res["fun"]
 
         print("LS estimation:")
         for k in range(len(self.lines)):
@@ -278,13 +268,12 @@ class SpecLine:
         vel_mean_mu=[],
         vel_mean_sig=[],
         vel_mean_diff=[],
-        ln_vel_sig_mu=[],
-        ln_vel_sig_sig=[],
-        ln_vel_sig_diff=[],
-        ln_vel_sig_min=[],
-        ln_vel_sig_max=[],
-        amp_lim=[-1e5, 1e5],
-        fix_continuum=None,
+        log_vel_sig_mu=[],
+        log_vel_sig_sig=[],
+        log_vel_sig_diff=[],
+        log_vel_sig_min=[],
+        log_vel_sig_max=[],
+        log_amp_lim=[0, 5],
         sampler="NUTS",
         nburn=2000,
         target_accept=0.8,
@@ -307,20 +296,20 @@ class SpecLine:
             standard deviations of the difference between velocity components
             list of tuples - (j, k, v_diff) : Var(v_j - v_k) = v_diff**2
 
-        ln_vel_sig_mu, ln_vel_sig_sig : float, default=[]
+        log_vel_sig_mu, log_vel_sig_sig : float, default=[]
             means/standard deviations of the logarithmic velocity dispersion priors
 
-        ln_vel_sig_diff : array_like, default=[]
+        log_vel_sig_diff : array_like, default=[]
             standard deviations of the difference between the logarithmic velocity dispersions
-            list of tuples - (j, k, ln_v_sig_diff) : Var(ln_v_sig_j - ln_v_sig_k) = ln_v_sig_diff**2
+            list of tuples - (j, k, log_v_sig_diff) : Var(log_v_sig_j - log_v_sig_k) = log_v_sig_diff**2
 
-        ln_vel_sig_min, ln_vel_sig_max : array_like, default=[]
+        log_vel_sig_min, log_vel_sig_max : array_like, default=[]
             minimum/maximum logarithmic velocity dispersions
             if not None, a softplux function will be added the posterior to punish velocity
             dispersions greater than this value
 
-        amp_lim : float, default=[-1e5, 1e5]
-            allowed range of the amplitude
+        log_amp_lim : float, default=[-1e5, 1e5]
+            allowed range of the log_amplitude
 
         sampler : ['NUTS', 'MH'], default='NUTS'
             amp step function or collection of functions
@@ -352,40 +341,41 @@ class SpecLine:
         ax : matplotlib.axes
             the axes with the plot
         """
-        raise NotImplementedError("This method is not implemented yet")
         import pymc as pm
         import arviz as az
         import corner
 
         n_lines = len(self.lines)
 
-        with pm.Model() as GaussProfile:
+        with pm.Model() as Profile:
             # continuum fitting
-            if fix_continuum is not None:
-                fl1 = fl2 = fix_continuum
-            else:
-                # model flux at the blue edge
-                fl1 = pm.TruncatedNormal(
-                    "blue_fl",
-                    mu=self.blue_fl[0],
-                    sigma=self.blue_fl[1],
-                    lower=self.blue_fl[0] - self.blue_fl[1] * 2,
-                    upper=self.blue_fl[0] + self.blue_fl[1] * 2,
-                )
-                # model flux at the red edge
-                fl2 = pm.TruncatedNormal(
-                    "red_fl",
-                    mu=self.red_fl[0],
-                    sigma=self.red_fl[1],
-                    lower=self.red_fl[0] - self.red_fl[1] * 2,
-                    upper=self.red_fl[0] + self.red_fl[1] * 2,
-                )
+            # model flux at the blue edge
+            blue_fl_mean = np.asarray([fl[0] for fl in self.blue_fl])
+            blue_fl_std = np.asarray([fl[1] for fl in self.blue_fl])
+            red_fl_mean = np.asarray([fl[0] for fl in self.red_fl])
+            red_fl_std = np.asarray([fl[1] for fl in self.red_fl])
+            fl1 = pm.TruncatedNormal(
+                "blue_fl",
+                mu=blue_fl_mean,
+                sigma=blue_fl_std,
+                lower=blue_fl_mean - blue_fl_std * 2,
+                upper=blue_fl_mean + blue_fl_std * 2,
+            )
+            # model flux at the red edge
+            fl2 = pm.TruncatedNormal(
+                "red_fl",
+                mu=red_fl_mean,
+                sigma=red_fl_std,
+                lower=red_fl_mean - red_fl_std * 2,
+                upper=red_fl_mean + red_fl_std * 2,
+            )
 
-            # Gaussian profile
+            # absorption profile
             # amplitude
-            amp = pm.Uniform("amp", lower=amp_lim[0], upper=amp_lim[1], shape=(n_lines,))
+            log_amp = pm.Uniform("log_amp", lower=log_amp_lim[0], upper=log_amp_lim[1], shape=(n_lines,))
+            amp = pm.Deterministic("amp", 10**log_amp)
 
-            if (len(vel_mean_mu) == n_lines) and (len(ln_vel_sig_mu) == n_lines):
+            if (len(vel_mean_mu) == n_lines) and (len(log_vel_sig_mu) == n_lines):
                 # mean velocity
                 vel_mean_cov = np.diag(vel_mean_sig) ** 2  # covariance matrix
                 for j, k, mean_diff in vel_mean_diff:
@@ -397,35 +387,35 @@ class SpecLine:
                 v_mean = pm.MvNormal("v_mean", mu=vel_mean_mu, cov=vel_mean_cov)
 
                 # velocity dispersion
-                ln_vel_sig_cov = np.diag(ln_vel_sig_sig) ** 2  # covariance matrix
-                for j, k, ln_sig_diff in ln_vel_sig_diff:
-                    ln_vel_sig_cov[j, k] = ln_vel_sig_cov[k, j] = (
-                        ln_vel_sig_sig[j] ** 2 + ln_vel_sig_sig[k] ** 2 - ln_sig_diff**2
+                log_vel_sig_cov = np.diag(log_vel_sig_sig) ** 2  # covariance matrix
+                for j, k, log_sig_diff in log_vel_sig_diff:
+                    log_vel_sig_cov[j, k] = log_vel_sig_cov[k, j] = (
+                        log_vel_sig_sig[j] ** 2 + log_vel_sig_sig[k] ** 2 - log_sig_diff**2
                     ) / 2
-                ln_v_sig = pm.MvNormal(
-                    "ln_v_sig",
-                    mu=ln_vel_sig_mu,
-                    cov=ln_vel_sig_cov,
+                log_v_sig = pm.MvNormal(
+                    "log_v_sig",
+                    mu=log_vel_sig_mu,
+                    cov=log_vel_sig_cov,
                 )
-                if len(ln_vel_sig_min) == len(ln_vel_sig_mu):
+                if len(log_vel_sig_min) == len(log_vel_sig_mu):
                     print("There is a vel_sig_min lim...")
                     pm.Potential(
                         "vel_sig_min_lim",
-                        -pm.math.log1pexp(-(ln_v_sig - ln_vel_sig_min) * 5**2),
+                        -pm.math.log1pexp(-(log_v_sig - log_vel_sig_min) * 5**2),
                     )
-                if len(ln_vel_sig_max) == len(ln_vel_sig_mu):
+                if len(log_vel_sig_max) == len(log_vel_sig_mu):
                     print("There is a vel_sig_max lim...")
                     pm.Potential(
                         "vel_sig_max_lim",
-                        -pm.math.log1pexp((ln_v_sig - ln_vel_sig_max) * 5**2),
+                        -pm.math.log1pexp((log_v_sig - log_vel_sig_max) * 5**2),
                     )
             else:
                 raise IndexError("The number of the velocity priors does not match the number of lines")
 
-            v_sig = pm.Deterministic("v_sig", np.exp(ln_v_sig))
+            v_sig = pm.Deterministic("v_sig", 10**log_v_sig)
             theta = [fl1, fl2]
             for k in range(n_lines):
-                theta += [v_mean[k], ln_v_sig[k], amp[k]]
+                theta += [v_mean[k], log_v_sig[k], amp[k]]
             # relative intensity of lines
             rel_strength = []
             ratio_index = []
@@ -452,14 +442,12 @@ class SpecLine:
                 "mu",
                 calc_model_flux(
                     theta,
-                    self.vel_resolution,
-                    rel_strength,
-                    self.lambda_0,
-                    self.blue_vel,
-                    self.red_vel,
-                    self.vel_rf,
-                    self.lines,
-                    self.line_model,
+                    wv_rf=self.wv_line,
+                    lines=self.lines,
+                    rel_strength=rel_strength,
+                    line_regions=self.line_regions,
+                    vel_resolution=self.vel_resolution,
+                    model=self.line_model,
                 ),
             )
 
@@ -473,7 +461,7 @@ class SpecLine:
             Flux = pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.fl_norm)
 
         if plot_structure:
-            pm.model_to_graphviz(GaussProfile)
+            pm.model_to_graphviz(Profile)
             plt.show()
 
         # initialization
@@ -483,7 +471,7 @@ class SpecLine:
             start = {}
             start["blue_fl"], start["red_fl"] = self.blue_fl[0], self.red_fl[0]
             start["v_mean"] = initial[2::3]
-            start["ln_v_sig"] = initial[3::3]
+            start["log_v_sig"] = initial[3::3]
             start["amp"] = initial[4::3]
             # start["sigma_0"] = 1e-3
             for k, free in enumerate(self.free_rel_strength):
@@ -491,7 +479,7 @@ class SpecLine:
                     start[f"ratio_{k}"] = self.rel_strength[k]
                     start[f"log_ratio_{k}"] = np.log10(self.rel_strength[k])
 
-        with GaussProfile:
+        with Profile:
             if sampler == "NUTS":
                 trace = pm.sample(
                     return_inferencedata=True,
@@ -532,13 +520,13 @@ class SpecLine:
         self.sig_EW = []
         for k in range(n_lines):
             theta.append(all["mean"][f"v_mean[{k}]"])
-            theta.append(all["mean"][f"ln_v_sig[{k}]"])
+            theta.append(all["mean"][f"log_v_sig[{k}]"])
             theta.append(all["mean"][f"amp[{k}]"])
             self.EW.append(all["mean"][f"EW_{k}"])
             self.sig_EW.append(all["sd"][f"EW_{k}"])
 
             sig_theta.append(all["sd"][f"v_mean[{k}]"])
-            sig_theta.append(all["sd"][f"ln_v_sig[{k}]"])
+            sig_theta.append(all["sd"][f"log_v_sig[{k}]"])
             sig_theta.append(all["sd"][f"amp[{k}]"])
         self.theta_MCMC = theta
         self.sig_theta_MCMC = sig_theta
@@ -552,7 +540,7 @@ class SpecLine:
             ]
             for k in range(n_lines):
                 theta_MAP.append(np.array(trace.posterior[f"v_mean"])[ind][k])
-                theta_MAP.append(np.array(trace.posterior[f"ln_v_sig"])[ind][k])
+                theta_MAP.append(np.array(trace.posterior[f"log_v_sig"])[ind][k])
                 theta_MAP.append(np.array(trace.posterior[f"amp"])[ind][k])
             self.theta_MAP = theta_MAP
 
@@ -581,9 +569,9 @@ class SpecLine:
                 else:
                     theta_MCMC = self.theta_MCMC
                 ax = self.plot_model(theta_MCMC, return_ax=True)
-            return trace, GaussProfile, ax
+            return trace, Profile, ax
         else:
-            return trace, GaussProfile
+            return trace, Profile
 
     def plot_model(
         self,
@@ -838,7 +826,7 @@ class SpecLine:
 ###################### Likelihood ##########################
 
 
-def lnlike_gaussian_abs(theta, spec_line: SpecLine):
+def lnlike_gaussian_abs(theta, spec_line: SpecLine) -> float:
     """Log likelihood function assuming Gaussian profile
 
     Parameters
@@ -858,12 +846,15 @@ def lnlike_gaussian_abs(theta, spec_line: SpecLine):
         the log likelihood function
     """
 
-    n_cont = 2 * len(spec_line.line_regions)
+    # n_cont = 2 * len(spec_line.line_regions)
     n_lines = 3 * len(spec_line.lines)
+    theta_cont = []
+    for k in range(len(spec_line.line_regions)):
+        theta_cont.append(spec_line.blue_fl[k][0])
+        theta_cont.append(spec_line.red_fl[k][0])
+    theta0 = np.append(theta_cont, theta[: n_lines])
 
-    theta0 = theta[: n_cont + n_lines]
-
-    rel_strength = spec_line.get_rel_strength(theta)
+    rel_strength = spec_line.get_rel_strength(np.append(theta_cont, theta))
 
     model_flux = calc_model_flux(
         theta0,

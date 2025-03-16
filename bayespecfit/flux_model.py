@@ -80,7 +80,7 @@ def calc_model_flux(
     theta : array_like
         fitting parameters:
             (flux at the blue edge, flux at the red edge) * Number of the line regions,
-            (mean of relative velocity, log standard deviation, amplitude) * Number of velocity components,
+            (mean of relative velocity, log standard deviation, log amplitude) * Number of velocity components,
             log10 line ratio for each velocity components (if set free)
 
     wv_rf : ArrayLike
@@ -143,8 +143,9 @@ def calc_model_flux(
     absorption = np.zeros_like(wv_rf)
 
     for k in range(len(lines)):
-        mean_vel, lnsig, amplitude = theta_abs[3 * k : 3 * k + 3]
-        sig_vel = np.exp(lnsig)
+        mean_vel, log_sig_vel, log_amp = theta_abs[3 * k : 3 * k + 3]
+        sig_vel = 10 ** log_sig_vel
+        amp = 10 ** log_amp
         sig_instru = (sig_vel**2 + vel_res**2) ** 0.5
 
         for rel_s, li in zip(rel_strength[k], lines[k]):
@@ -155,7 +156,7 @@ def calc_model_flux(
                 calc = _calc_lorentzian
             else:
                 raise NameError("Line model not supported (optional: Gauss & Lorentz)")
-            absorption += rel_s * calc(mean_vel, sig_instru, amplitude, vel_rf)
+            absorption += rel_s * calc(mean_vel, sig_instru, amp, vel_rf)
 
     model_flux = continuum * (1 - absorption)
 
