@@ -124,7 +124,6 @@ class SpectrumSN:
         line_regions: list[tuple[float, float]],
         lines_id: Optional[list[int]] = None,
         rel_strength: Optional[list[list[float]] | list[float]] = None,
-        free_rel_strength: Optional[list[bool]] = None,
         line_model: str = "Gauss",
         mask: Optional[list[tuple, tuple]] = None,
         plot_region: bool = False,
@@ -151,10 +150,6 @@ class SpectrumSN:
             the relative strength between each line in the series
             default: all lines are of the equal strength
 
-        free_rel_strength : array_like, default=None
-            whether to set the relative strength of each line series as
-            another free parameter in MCMC fit
-
         line_model : str, default="Gauss"
             the line profile model: "Gauss" or "Lorentzian"
 
@@ -171,7 +166,6 @@ class SpectrumSN:
             line_regions=line_regions,
             lines_id=lines_id,
             rel_strength=rel_strength,
-            free_rel_strength=free_rel_strength,
             line_model=line_model,
             spec_resolution=self.spec_resolution,
             mask=mask,
