@@ -102,23 +102,31 @@ def calc_model_flux(
     using_tensor = contains_tensor_variable(
         wv_rf, fl_blue, fl_red, vel_mean, log_vel_sig, log_amp, rel_strength
     )
+
+    # Choose the correct implementation based on the model
+    if model == "Gauss":
+        calc = _calc_gauss
+    elif model == "Lorentz":
+        calc = _calc_lorentzian
+    else:
+        raise NameError("Line model not supported (optional: Gauss & Lorentz)")
     
     # Choose the implementation based on input types
     if using_tensor:
         return _calc_model_flux_tensor(
             wv_rf, fl_blue, fl_red, vel_mean, log_vel_sig, log_amp,
-            lines, rel_strength, line_regions, vel_resolution, model
+            lines, rel_strength, line_regions, vel_resolution, calc
         )
     else:
         return _calc_model_flux_numpy(
             wv_rf, fl_blue, fl_red, vel_mean, log_vel_sig, log_amp,
-            lines, rel_strength, line_regions, vel_resolution, model
+            lines, rel_strength, line_regions, vel_resolution, calc
         )
 
 
 def _calc_model_flux_numpy(
     wv_rf, fl_blue, fl_red, vel_mean, log_vel_sig, log_amp,
-    lines, rel_strength, line_regions, vel_resolution, model
+    lines, rel_strength, line_regions, vel_resolution, calc
 ):
     """NumPy implementation for non-tensor inputs."""
     # Convert inputs to numpy arrays
@@ -156,15 +164,13 @@ def _calc_model_flux_numpy(
     for k in range(len(lines)):
         sig_instru = (sig_vel[k]**2 + vel_res**2) ** 0.5
 
-        for rel_s, li in zip(rel_strength[k], lines[k]):
+        for rel_s, li in zip(rel_strength[k], lines[k][:-1]):
             vel_rf = velocity_rf(wv_rf, li)
-            if model == "Gauss":
-                calc = _calc_gauss
-            elif model == "Lorentz":
-                calc = _calc_lorentzian
-            else:
-                raise NameError("Line model not supported (optional: Gauss & Lorentz)")
             absorption += rel_s * calc(vel_mean[k], sig_instru, amp[k], vel_rf)
+
+        # The last line: rel_s is fixed to 1
+        vel_rf = velocity_rf(wv_rf, lines[k][-1])
+        absorption += calc(vel_mean[k], sig_instru, amp[k], vel_rf)
 
     model_flux = continuum * (1 - absorption)
 
@@ -173,7 +179,7 @@ def _calc_model_flux_numpy(
 
 def _calc_model_flux_tensor(
     wv_rf, fl_blue, fl_red, vel_mean, log_vel_sig, log_amp,
-    lines, rel_strength, line_regions, vel_resolution, model
+    lines, rel_strength, line_regions, vel_resolution, calc
 ):
     """PyTensor implementation for tensor inputs."""
     # Convert inputs to tensor variables
@@ -240,39 +246,22 @@ def _calc_model_flux_tensor(
         sig_instru = pt.sqrt(sig_vel[k]**2 + vel_res_tensor**2)
         
         # Loop through components
-        for j, (rel_s, li) in enumerate(zip(rel_strength[k], lines[k])):
+        for j, (rel_s, li) in enumerate(zip(rel_strength[k], lines[k][:-1])):
             # Convert wavelength to velocity
             vel_rf = velocity_rf(wv_rf, li)
             rel_s_tensor = pt.as_tensor_variable(rel_s)
             
             # Calculate absorption profile
-            if model == "Gauss":
-                profile = _calc_gauss(vel_mean[k], sig_instru, amp[k], vel_rf)
-            elif model == "Lorentz":
-                profile = _calc_lorentzian(vel_mean[k], sig_instru, amp[k], vel_rf)
-            else:
-                raise NameError("Line model not supported (optional: Gauss & Lorentz)")
+            profile = calc(vel_mean[k], sig_instru, amp[k], vel_rf)
                 
             # Add to total absorption
             absorption = absorption + rel_s_tensor * profile
+
+        # The last line: rel_s is fixed to 1
+        vel_rf = velocity_rf(wv_rf, lines[k][-1])
+        absorption = absorption + calc(vel_mean[k], sig_instru, amp[k], vel_rf)
     
     # Calculate final flux
     model_flux = continuum * (1 - absorption)
     
     return model_flux
-
-# Add a debugging function to check shapes
-def debug_shapes(*args, names=None):
-    """Print shapes of all arguments to help debug shape issues."""
-    if names is None:
-        names = [f"arg{i}" for i in range(len(args))]
-    
-    for name, arg in zip(names, args):
-        if isinstance(arg, (pt.TensorVariable, pt.TensorConstant)):
-            print(f"{name}: TensorVariable with shape {arg.shape.eval() if hasattr(arg.shape, 'eval') else arg.shape}")
-        elif isinstance(arg, np.ndarray):
-            print(f"{name}: NumPy array with shape {arg.shape}")
-        elif hasattr(arg, '__len__') and not isinstance(arg, str):
-            print(f"{name}: Sequence with length {len(arg)}")
-        else:
-            print(f"{name}: Scalar or other type")

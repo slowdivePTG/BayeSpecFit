@@ -55,6 +55,7 @@ class SpecLine:
         line_regions: list[tuple[float, float]] | tuple[float, float],
         lines_id: Optional[list[str]] = None,
         rel_strength: Optional[list[list[float]] | list[float]] = None,
+        free_rel_strength: Optional[list[bool]] = None,
         line_model: str = "Gauss",
         mask: Optional[list[tuple, tuple]] = None,
         spec_resolution: float = 0,
@@ -92,6 +93,10 @@ class SpecLine:
             2D for multiple components:
                 Ca II IRT [[], []]
                 He I/Fe II [[], [0.382, 0.239, 0.172]]
+
+        free_rel_strength : array_like, default=[]
+            whether to set the relative strength of each line series as
+            another free parameter in MCMC fit
 
         line_model : string
             ["Gauss", "Lorentz"]
@@ -190,6 +195,12 @@ class SpecLine:
             elif len(lines[k]) != len(rel_strength[k]):
                 raise IndexError("The number of line components and their relative strength do not match in shape")
 
+        # check if the shapes of lines and free_rel_strength match
+        if free_rel_strength is None:
+            free_rel_strength = np.zeros(len(lines), dtype=bool)
+        elif len(free_rel_strength) != len(lines):
+            raise IndexError("The number of lines and the free_rel_strength indicator do not match in shape")
+
         # reorder the lines based on their relative strength
         self.rel_strength = []
         self.lines = []
@@ -197,13 +208,15 @@ class SpecLine:
         for li, rs in zip(lines, rel_strength):
             idx = np.argsort(rs)
             self.lines.append(np.array(li)[idx])
-            self.rel_strength.append(np.array(rs)[idx] / np.max(rs))
+            self.rel_strength.append(np.array(rs)[idx][:-1] / np.max(rs))
 
         if lines_id is None:
             lines_id = [f"line_{k}" for k in range(len(lines))]
         elif len(lines_id) != len(lines):
             raise IndexError(f"The number of lines ({len(lines)}) and their ID ({len(lines_id)}) do not match in shape")
         self.lines_id = lines_id
+
+        self.free_rel_strength = free_rel_strength
 
         # initialize the fitting results
         self.theta_LS = None
@@ -269,7 +282,6 @@ class SpecLine:
         sampler="NUTS",
         nburn=2000,
         target_accept=0.8,
-        find_MAP=False,
         plot_structure=False,
         plot_mcmc=False,
     ) -> tuple[InferenceData, Model]:
@@ -315,9 +327,6 @@ class SpecLine:
         target_accept : float in [0, 1], default=0.8
             the step size is tuned such that we approximate this acceptance rate
             higher values like 0.9 or 0.95 often work better for problematic posteriors
-
-        find_MAP : bool, default=False
-            whether to find the local maximum a posteriori point given a model
 
         plot_mcmc : bool, default=False
             whether to plot the MCMC chains and corner plots
@@ -416,15 +425,28 @@ class SpecLine:
                 theta += [fl1[k], fl2[k]]
             for k in range(n_lines):
                 theta += [v_mean[k], log_v_sig[k], amp[k]]
-            # equivalent width
-            # EW_k = pm.Deterministic(
-            #     f"EW_{k}",
-            #     -amp[k]
-            #     / (self.red_vel - self.blue_vel)
-            #     / ((fl1 + fl2) / 2)
-            #     * (self.wv_line[-1] - self.wv_line[0])
-            #     * pm.math.sum(rel_strength[k]),
-            # )
+            # relative intensity of lines
+            rel_strength = []
+            ratio_index = []
+            for k, free in enumerate(self.free_rel_strength):
+                if free:
+                    ratio_index.append(k)
+                    log_ratio_0 = np.log10(self.rel_strength[k])
+                    # weaker lines are always weaker (log ratio <= 0)
+                    log_rel_strength_k = pm.TruncatedNormal(f"log_ratio_{k}", mu=log_ratio_0, sigma=1, upper=0)
+                    rel_strength.append(pm.Deterministic(f"ratio_{k}", 10**log_rel_strength_k))
+                else:
+                    # rel_strength.append(pm.Deterministic(f"ratio_{k}", pt.as_tensor_variable(self.rel_strength[k])))
+                    rel_strength.append(self.rel_strength[k])
+                # equivalent width
+                # EW_k = pm.Deterministic(
+                #     f"EW_{k}",
+                #     -amp[k]
+                #     / (self.red_vel - self.blue_vel)
+                #     / ((fl1 + fl2) / 2)
+                #     * (self.wv_line[-1] - self.wv_line[0])
+                #     * pm.math.sum(rel_strength[k]),
+                # )
 
             # flux expectation
             mu = pm.Deterministic(
@@ -437,7 +459,7 @@ class SpecLine:
                     log_amp=log_amp,
                     wv_rf=self.wv_line,
                     lines=self.lines,
-                    rel_strength=self.rel_strength,
+                    rel_strength=rel_strength,
                     line_regions=self.line_regions,
                     vel_resolution=self.vel_resolution,
                     model=self.line_model,
@@ -461,12 +483,18 @@ class SpecLine:
         if initial is None:
             start = None
         else:
+            initial = initial[:2 * n_line_regions + 3 * n_lines]
             start = {}
-            start["fl_blue"] = initial[0 : 2 * len(self.line_regions) : 2]
-            start["fl_red"] = initial[1 : 2 * len(self.line_regions) : 2]
+            start["fl_blue"] = self.fl_blue
+            start["fl_red"] = self.fl_red
             start["v_mean"] = initial[2 * len(self.line_regions) :: 3]
             start["log_v_sig"] = initial[2 * len(self.line_regions) + 1 :: 3]
             start["amp"] = initial[2 * len(self.line_regions) + 2 :: 3]
+            # start["sigma_0"] = 1e-3
+            for k, free in enumerate(self.free_rel_strength):
+                if free:
+                    start[f"ratio_{k}"] = self.rel_strength[k]
+                    start[f"log_ratio_{k}"] = np.log10(self.rel_strength[k])
 
         with Profile:
             if sampler == "NUTS":
@@ -485,6 +513,8 @@ class SpecLine:
                 )
         self.trace = trace
         var_names_summary = ["v_mean", "v_sig", "amp"]
+        for k in ratio_index:
+            var_names_summary.append(f"log_ratio_{k}")
         # for k in range(n_lines):
         #     var_names_summary.append(f"EW_{k}")
         summary = az.summary(
@@ -497,8 +527,7 @@ class SpecLine:
         print(summary)
 
         all = az.summary(trace, kind="stats")
-        # theta = [all["mean"]["fl_blue"], all["mean"]["fl_red"]]
-        # sig_theta = [all["sd"]["fl_blue"], all["sd"]["fl_red"]]
+
         theta = []
         sig_theta = []
         self.EW = []
@@ -518,27 +547,39 @@ class SpecLine:
             sig_theta.append(all["sd"][f"v_mean[{k}]"])
             sig_theta.append(all["sd"][f"log_v_sig[{k}]"])
             sig_theta.append(all["sd"][f"log_amp[{k}]"])
+        for j in ratio_index:
+            for k in range(len(self.lines[j]) - 1):
+                if f"ratio_{j}[{k}]" in all["mean"].index:
+                    theta.append(all["mean"][f"log_ratio_{j}[{k}]"])
+                    sig_theta.append(all["sd"][f"log_ratio_{j}[{k}]"])
         self.theta_MCMC = theta
         self.sig_theta_MCMC = sig_theta
 
-        if find_MAP:
-            neg_log_posterior = -np.array(trace.sample_stats.lp)
-            ind = np.unravel_index(np.argmin(neg_log_posterior, axis=None), neg_log_posterior.shape)
-            theta_MAP = [
-                np.array(trace.posterior["fl_blue"])[ind],
-                np.array(trace.posterior["fl_red"])[ind],
-            ]
-            for k in range(n_lines):
-                theta_MAP.append(np.array(trace.posterior[f"v_mean"])[ind][k])
-                theta_MAP.append(np.array(trace.posterior[f"log_v_sig"])[ind][k])
-                theta_MAP.append(np.array(trace.posterior[f"amp"])[ind][k])
-            self.theta_MAP = theta_MAP
+        # find the maximum a posteriori point
+        neg_log_posterior = -np.array(trace.sample_stats.lp)
+        ind = np.unravel_index(np.argmin(neg_log_posterior, axis=None), neg_log_posterior.shape)
+        theta_MAP = []
+        for k in range(n_line_regions):
+            theta_MAP.append(np.array(trace.posterior["fl_blue"])[ind][k])
+            theta_MAP.append(np.array(trace.posterior["fl_red"])[ind][k])
+        
+        for k in range(n_lines):
+            theta_MAP.append(np.array(trace.posterior[f"v_mean"])[ind][k])
+            theta_MAP.append(np.array(trace.posterior[f"log_v_sig"])[ind][k])
+            theta_MAP.append(np.array(trace.posterior[f"log_amp"])[ind][k])
+
+        for j in ratio_index:
+            for k in range(len(self.lines[j]) - 1):
+                theta_MAP.append(np.array(trace.posterior[f"log_ratio_{j}"])[ind][k])
+        self.theta_MAP = theta_MAP
 
         if plot_mcmc:
             # by default, show the mean velocity, velocity dispersion, pseudo-EW, and line ratios
             var_names_plot = ["v_mean", "v_sig"]
             # for k in range(n_lines):
             #     var_names_plot.append(f"EW_{k}")
+            for k in ratio_index:
+                var_names_plot.append(f"ratio_{k}")
             corner.corner(trace, var_names=var_names_plot)
 
         return trace, Profile
@@ -594,11 +635,13 @@ class SpecLine:
             raise IndexError("The number of axes and line regions do not match")
 
         params = self.decode_theta(theta)
+        log_ratio = params.pop("log_ratio")
+        rel_strength = self.get_rel_strength(log_ratio=log_ratio)
         model_flux = calc_model_flux(
             **params,
             wv_rf=self.wv_line,
             lines=self.lines,
-            rel_strength=self.rel_strength,
+            rel_strength=rel_strength,
             line_regions=self.line_regions,
             vel_resolution=self.vel_resolution,
             model=self.line_model,
@@ -611,13 +654,14 @@ class SpecLine:
                     theta[2 * n_line_regions + 3 * k : 2 * n_line_regions + 3 * (k + 1)],
                 )
             params_elem = self.decode_theta(theta_elem)
+            params_elem.pop("log_ratio")
 
             model_flux_elem.append(
                 calc_model_flux(
                     **params_elem,
                     wv_rf=self.wv_line,
                     lines=[self.lines[k]],
-                    rel_strength=[self.rel_strength[k]],
+                    rel_strength=[rel_strength[k]],
                     line_regions=self.line_regions,
                     vel_resolution=self.vel_resolution,
                     model=self.line_model,
@@ -670,7 +714,7 @@ class SpecLine:
                     **params,
                     wv_rf=spec_plot[:, 0],
                     lines=self.lines,
-                    rel_strength=self.rel_strength,
+                    rel_strength=rel_strength,
                     line_regions=self.line_regions,
                     vel_resolution=self.vel_resolution,
                     model=self.line_model,
@@ -779,6 +823,26 @@ class SpecLine:
             repr(e)
             return None, None
 
+    def get_rel_strength(self, log_ratio: Optional[list] = None) -> list[list[float]]:
+        """Get the relative strength of the absorption lines"""
+
+        rel_strength = self.rel_strength.copy()
+
+        # return the relative strength if not set free
+        if log_ratio is None:
+            return rel_strength
+
+        # update the relative strength if set free
+        idx_rel = 0
+        for k, rel in enumerate(self.free_rel_strength):
+            if rel:
+                for rel_s in range(len(self.rel_strength[k])):
+                    rel_strength[k][rel_s] = 10 ** log_ratio[idx_rel]
+                    idx_rel += 1
+        if idx_rel != len(log_ratio):
+            raise IndexError(f"Number of free parameters ({len(log_ratio)}) and relative strength ({idx_rel}) do not match")
+        return rel_strength
+
     def decode_theta(self, theta: list) -> dict:
         """Decode the fitting parameters"""
         n_cont = 2 * len(self.line_regions)
@@ -791,12 +855,15 @@ class SpecLine:
         log_vel_sig = theta[n_cont + 1 : n_cont + n_lines : 3]
         log_amp = theta[n_cont + 2 : n_cont + n_lines : 3]
 
+        log_ratio = theta[n_cont + n_lines :]
+
         return dict(
             fl_blue=fl_blue,
             fl_red=fl_red,
             vel_mean=vel_mean,
             log_vel_sig=log_vel_sig,
             log_amp=log_amp,
+            log_ratio=log_ratio,
         )
 
 
@@ -830,12 +897,15 @@ def lnlike_gaussian_abs(theta, spec_line: SpecLine) -> float:
     theta0 = np.append(theta_cont, theta)
 
     params = spec_line.decode_theta(theta0)
+    log_ratio = params.pop("log_ratio")
+
+    rel_strength = spec_line.get_rel_strength(log_ratio=log_ratio)
 
     model_flux = calc_model_flux(
         **params,
         wv_rf=spec_line.wv_line,
         lines=spec_line.lines,
-        rel_strength=spec_line.rel_strength,
+        rel_strength=rel_strength,
         line_regions=spec_line.line_regions,
         vel_resolution=spec_line.vel_resolution,
         model=spec_line.line_model,
@@ -854,3 +924,19 @@ def neg_lnlike_gaussian_abs(theta, spec_line):
 
     lnl = lnlike_gaussian_abs(theta, spec_line)
     return -lnl
+
+# Add a debugging function to check shapes
+def debug_shapes(*args, names=None):
+    """Print shapes of all arguments to help debug shape issues."""
+    if names is None:
+        names = [f"arg{i}" for i in range(len(args))]
+    
+    for name, arg in zip(names, args):
+        if isinstance(arg, (pt.TensorVariable, pt.TensorConstant)):
+            print(f"{name}: TensorVariable with shape {arg.shape.eval() if hasattr(arg.shape, 'eval') else arg.shape}")
+        elif isinstance(arg, np.ndarray):
+            print(f"{name}: NumPy array with shape {arg.shape}")
+        elif hasattr(arg, '__len__') and not isinstance(arg, str):
+            print(f"{name}: Sequence with length {len(arg)}")
+        else:
+            print(f"{name}: Scalar or other type")
