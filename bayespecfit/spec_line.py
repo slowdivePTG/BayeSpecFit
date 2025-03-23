@@ -14,7 +14,7 @@ from .flux_model import velocity_rf, calc_model_flux
 
 from ._utils import plt
 
-from numpy.typing import ArrayLike
+from numpy.typing import ArrayLike, NDArray
 from typing import Optional
 from matplotlib.axes import Axes
 from arviz.data.inference_data import InferenceData
@@ -584,6 +584,66 @@ class SpecLine:
 
         return trace, Profile
 
+    def get_model_flux(self, theta: list, wv: ArrayLike, get_indivial: bool = False) -> NDArray | list[NDArray]:
+        """Get the absorption at some given wavelength
+
+        Parameters
+        ----------
+        theta : list
+            fitting parameters: flux at the blue edge, flux at the
+            red edge, (mean of relative velocity, log standard deviation,
+            amplitude) * Number of velocity components
+
+        wv : array_like
+            the wavelength to calculate the absorption
+
+        get_indivial : bool, default=False
+            whether to return the absorption of each line
+
+        Returns
+        -------
+        absorption : NDArray | list[NDArray]
+            the absorption at the given wavelength
+        """
+
+        params = self.decode_theta(theta)
+        log_ratio = params.pop("log_ratio")
+        rel_strength = self.get_rel_strength(log_ratio=log_ratio)
+
+        if get_indivial:
+            absorption = []
+            for k in range(len(self.lines)):
+                theta_elem = np.append(
+                    theta[: 2 * len(self.line_regions)],
+                    theta[2 * len(self.line_regions) + 3 * k : 2 * len(self.line_regions) + 3 * (k + 1)],
+                )
+                params_elem = self.decode_theta(theta_elem)
+                params_elem.pop("log_ratio")
+
+                absorption.append(
+                    calc_model_flux(
+                        **params_elem,
+                        wv_rf=wv,
+                        lines=[self.lines[k]],
+                        rel_strength=[rel_strength[k]],
+                        line_regions=self.line_regions,
+                        vel_resolution=self.vel_resolution,
+                        model=self.line_model,
+                    )
+                )
+        else:
+            absorption = calc_model_flux(
+                **params,
+                wv_rf=wv,
+                lines=self.lines,
+                rel_strength=rel_strength,
+                line_regions=self.line_regions,
+                vel_resolution=self.vel_resolution,
+                model=self.line_model,
+            )
+
+        return absorption
+
     def plot_model(
         self,
         theta: list,
@@ -634,39 +694,8 @@ class SpecLine:
         if len(ax) != n_line_regions:
             raise IndexError("The number of axes and line regions do not match")
 
-        params = self.decode_theta(theta)
-        log_ratio = params.pop("log_ratio")
-        rel_strength = self.get_rel_strength(log_ratio=log_ratio)
-        model_flux = calc_model_flux(
-            **params,
-            wv_rf=self.wv_line,
-            lines=self.lines,
-            rel_strength=rel_strength,
-            line_regions=self.line_regions,
-            vel_resolution=self.vel_resolution,
-            model=self.line_model,
-        )
-
-        model_flux_elem = []
-        for k in range(len(self.lines)):
-            theta_elem = np.append(
-                    theta[: 2 * n_line_regions],
-                    theta[2 * n_line_regions + 3 * k : 2 * n_line_regions + 3 * (k + 1)],
-                )
-            params_elem = self.decode_theta(theta_elem)
-            params_elem.pop("log_ratio")
-
-            model_flux_elem.append(
-                calc_model_flux(
-                    **params_elem,
-                    wv_rf=self.wv_line,
-                    lines=[self.lines[k]],
-                    rel_strength=[rel_strength[k]],
-                    line_regions=self.line_regions,
-                    vel_resolution=self.vel_resolution,
-                    model=self.line_model,
-                )
-            )
+        model_flux = self.get_model_flux(theta, self.wv_line)
+        model_flux_elem = self.get_model_flux(theta, self.wv_line, get_indivial=True)
 
         spec = np.array([self.wv_line_unmasked, self.fl_norm_unmasked, self.fl_norm_unc_unmasked]).T
 
@@ -709,18 +738,7 @@ class SpecLine:
             )
 
             # plot the residuals
-            model_res = (
-                calc_model_flux(
-                    **params,
-                    wv_rf=spec_plot[:, 0],
-                    lines=self.lines,
-                    rel_strength=rel_strength,
-                    line_regions=self.line_regions,
-                    vel_resolution=self.vel_resolution,
-                    model=self.line_model,
-                )
-                - spec_plot[:, 1]
-            )
+            model_res = self.get_model_flux(theta, spec_plot[:, 0]) - spec_plot[:, 1]
             ax[k].plot(vel_rf_plot, model_res, color="grey")
 
             # plot the edges of the line region
