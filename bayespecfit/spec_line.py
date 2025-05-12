@@ -433,8 +433,10 @@ class SpecLine:
                     ratio_index.append(k)
                     log_ratio_0 = np.log10(self.rel_strength[k])
                     # weaker lines are always weaker (log ratio <= 0)
-                    log_rel_strength_k = pm.TruncatedNormal(f"log_ratio_{k}", mu=log_ratio_0, sigma=1, upper=0)
-                    rel_strength.append(pm.Deterministic(f"ratio_{k}", 10**log_rel_strength_k))
+                    # log_rel_strength_k = pm.TruncatedNormal(f"log_ratio_{k}", mu=log_ratio_0, sigma=1, upper=0)
+                    log_rel_strength_k = pm.Uniform(f"log_ratio_{k}", lower=-3.0, upper=0.0, shape=(1,))
+                    rel_strength_k = pm.Deterministic(f"ratio_{k}", 10**log_rel_strength_k)
+                    rel_strength.append(rel_strength_k)
                 else:
                     # rel_strength.append(pm.Deterministic(f"ratio_{k}", pt.as_tensor_variable(self.rel_strength[k])))
                     rel_strength.append(self.rel_strength[k])
@@ -888,31 +890,39 @@ class SpecLine:
 ###################### Likelihood ##########################
 
 
-def lnlike_gaussian_abs(theta, spec_line: SpecLine) -> float:
+def lnlike_gaussian_abs(theta, spec_line: SpecLine, flux_at_edge: bool = False) -> float:
     """Log likelihood function assuming Gaussian profile
 
     Parameters
     ----------
     theta : array_like
         fitting parameters:
-            (flux at the blue edge, flux at the red edge) * Number of the line regions,
+            if flux_at_edge is True:
+                (flux at the blue edge, flux at the red edge) * Number of the line regions,
             (mean of relative velocity, log standard deviation, amplitude) * Number of velocity components,
             log10 line ratio for each velocity components (if set free)
 
     spec_line : sn_line_vel.SpecLine.SpecLine
         the SpecLine object
 
+    flux_edge : bool, default=False
+        whether the theta contains the flux at the blue and red edges
+        if not, use the prior (i.e., the flux measured right at the edges)
+
     Returns
     -------
     lnl : float
         the log likelihood function
     """
-
-    theta_cont = []
-    for k in range(len(spec_line.line_regions)):
-        theta_cont.append(spec_line.fl_blue[k])
-        theta_cont.append(spec_line.fl_red[k])
-    theta0 = np.append(theta_cont, theta)
+    
+    if flux_at_edge:
+        theta0 = theta
+    else:
+        theta_cont = []
+        for k in range(len(spec_line.line_regions)):
+            theta_cont.append(spec_line.fl_blue[k])
+            theta_cont.append(spec_line.fl_red[k])
+        theta0 = np.append(theta_cont, theta)
 
     params = spec_line.decode_theta(theta0)
     log_ratio = params.pop("log_ratio")
@@ -937,10 +947,10 @@ def lnlike_gaussian_abs(theta, spec_line: SpecLine) -> float:
     return lnl
 
 
-def neg_lnlike_gaussian_abs(theta, spec_line):
+def neg_lnlike_gaussian_abs(theta, spec_line, **kwargs):
     """negative log-likelihood function"""
 
-    lnl = lnlike_gaussian_abs(theta, spec_line)
+    lnl = lnlike_gaussian_abs(theta, spec_line, **kwargs)
     return -lnl
 
 # Add a debugging function to check shapes
