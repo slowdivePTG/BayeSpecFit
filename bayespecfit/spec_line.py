@@ -23,6 +23,91 @@ from pymc.model import Model
 SPEED_OF_LIGHT = 2.99792458e5
 
 
+def _validate_pairwise_diff_constraints(diff_constraints, n_lines: int, name: str) -> list[tuple[int, int, float]]:
+    """Validate pairwise prior widths for component differences."""
+
+    if diff_constraints is None:
+        return []
+
+    validated = []
+    seen = set()
+    for constraint in diff_constraints:
+        if len(constraint) != 3:
+            raise ValueError(f"{name} entries must be (j, k, sigma) tuples")
+        j, k, sigma = constraint
+        if not isinstance(j, (int, np.integer)) or not isinstance(k, (int, np.integer)):
+            raise TypeError(f"{name} indices must be integers")
+        if j == k:
+            raise ValueError(f"{name} cannot constrain a component to itself: ({j}, {k})")
+        if j < 0 or k < 0 or j >= n_lines or k >= n_lines:
+            raise IndexError(f"{name} indices ({j}, {k}) are out of range for {n_lines} line components")
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(f"{name} sigma for pair ({j}, {k}) must be positive and finite")
+
+        pair = tuple(sorted((int(j), int(k))))
+        if pair in seen:
+            raise ValueError(f"Duplicate {name} constraint for pair {pair}")
+        seen.add(pair)
+        validated.append((int(j), int(k), float(sigma)))
+
+    return validated
+
+
+def _add_pairwise_diff_potentials(values, diff_constraints, name: str):
+    """Add Gaussian priors on selected pairwise differences."""
+
+    for j, k, sigma in diff_constraints:
+        pm.Potential(
+            f"{name}_diff_{j}_{k}",
+            pm.logp(pm.Normal.dist(mu=0, sigma=sigma), values[j] - values[k]),
+        )
+
+
+def _validate_prior_bounds(lower, upper, n_lines: int, name: str):
+    """Validate lower/upper bounds for bounded flat priors."""
+
+    if lower is None or upper is None:
+        raise ValueError(f"{name} lower and upper bounds are required for a flat prior")
+
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    if lower.shape != (n_lines,) or upper.shape != (n_lines,):
+        raise IndexError(f"{name} bounds must each have length {n_lines}")
+    if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
+        raise ValueError(f"{name} bounds must be finite")
+    if np.any(lower >= upper):
+        raise ValueError(f"{name} lower bounds must be smaller than upper bounds")
+
+    return lower, upper
+
+
+def _validate_prior_inputs(mu, sigma, lower, upper, n_lines: int, name: str):
+    """Choose and validate either Gaussian inputs or bounded-flat inputs."""
+
+    has_bounds = lower is not None or upper is not None
+    has_gaussian = mu is not None or sigma is not None
+    if has_bounds and has_gaussian:
+        raise ValueError(f"{name} cannot use both bounds and Gaussian mean/scatter priors")
+
+    if has_bounds:
+        lower, upper = _validate_prior_bounds(lower, upper, n_lines, name)
+        return "uniform", lower, upper
+
+    if mu is None or sigma is None:
+        raise ValueError(f"{name} requires either lower/upper bounds or Gaussian mean/scatter priors")
+
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    if mu.shape != (n_lines,) or sigma.shape != (n_lines,):
+        raise IndexError(f"{name} Gaussian mean/scatter priors must each have length {n_lines}")
+    if not np.all(np.isfinite(mu)) or not np.all(np.isfinite(sigma)):
+        raise ValueError(f"{name} Gaussian mean/scatter priors must be finite")
+    if np.any(sigma <= 0):
+        raise ValueError(f"{name} Gaussian scatter priors must be positive")
+
+    return "normal", mu, sigma
+
+
 class SpecLine:
     """amp (series of) absorption line(s) in a 1D optical spectrum
 
@@ -103,6 +188,11 @@ class SpecLine:
 
         mask : list[tuple], optional
             line regions to be excluded in the fitting
+
+        spec_resolution : float or array_like, default=0
+            spectral FWHM resolution in Angstrom. If a scalar is provided, the same
+            resolution is used for every line region; otherwise provide one value per
+            line region. A value of 0 assumes infinite spectral resolution.
         """
 
         self.wv_rf, self.fl, self.fl_unc = spec[:, 0], spec[:, 1], spec[:, 2]
@@ -125,21 +215,27 @@ class SpecLine:
         else:
             self.mask = []
 
+        fl_line = self.fl[in_line_region]
+        fl_unc_line = self.fl_unc[in_line_region]
+        if not np.any(in_unmasked_region):
+            raise ValueError("No unmasked data points remain in the selected line regions")
+
         self.wv_line = wv_line[in_unmasked_region]
         self.wv_line_unmasked = wv_line
 
-        # normalized flux
-        self._fl_med = np.nanmedian(self.fl[in_line_region][in_unmasked_region])
-        fl_norm = self.fl[in_line_region] / self._fl_med
-        fl_norm_unc = self.fl_unc[in_line_region] / self._fl_med
+        # normalized flux; masked regions do not set the normalization scale
+        self._fl_med = np.nanmedian(fl_line[in_unmasked_region])
+        fl_norm = fl_line / self._fl_med
+        fl_norm_unc = fl_unc_line / self._fl_med
 
         # check if there are points with relative uncertainty
         # two orders of magnitude lower than the median
         rel_unc = fl_norm_unc / fl_norm
-        med_rel_unc = np.nanmedian(rel_unc)
-        if rel_unc.min() < med_rel_unc / 1e2:
+        rel_unc_fit = rel_unc[in_unmasked_region]
+        med_rel_unc = np.nanmedian(rel_unc_fit)
+        if rel_unc_fit.min() < med_rel_unc / 1e2:
             warnings.warn("Some flux with extremely low uncertainty!")
-            rel_unc[rel_unc < med_rel_unc / 1e2] = med_rel_unc
+            rel_unc[(rel_unc < med_rel_unc / 1e2) & in_unmasked_region] = med_rel_unc
             warnings.warn("New uncertainty assigned!")
 
         fl_norm_unc = rel_unc * fl_norm
@@ -167,9 +263,16 @@ class SpecLine:
             self.vel_resolution.append(vel_res)
 
             range_l = edge[1] - edge[0]
-            delta_l = min(spec_res * 3, range_l / 10)
-            fl_blue = self.get_flux_at_lambda(edge[0], delta_l=delta_l) / self._fl_med
-            fl_red = self.get_flux_at_lambda(edge[1], delta_l=delta_l) / self._fl_med
+            if spec_res > 0:
+                delta_l = min(spec_res * 3, range_l / 10)
+            else:
+                delta_l = range_l / 10
+            fl_blue = np.asarray(
+                self.get_flux_at_lambda(edge[0], delta_l=delta_l, spec_resolution=spec_res)
+            ) / self._fl_med
+            fl_red = np.asarray(
+                self.get_flux_at_lambda(edge[1], delta_l=delta_l, spec_resolution=spec_res)
+            ) / self._fl_med
             self.fl_blue[k] = fl_blue[0]
             self.fl_red[k] = fl_red[0]
             self.blue_fl_unc[k] = fl_blue[1]
@@ -269,13 +372,15 @@ class SpecLine:
 
     def MCMC_sampler(
         self,
-        vel_mean_mu: list[float],
-        vel_mean_sig: list[float],
-        log_vel_sig_mu: list[float],
-        log_vel_sig_sig: list[float],
+        vel_mean_mu: Optional[list[float]] = None,
+        vel_mean_sig: Optional[list[float]] = None,
+        log_vel_sig_mu: Optional[list[float]] = None,
+        log_vel_sig_sig: Optional[list[float]] = None,
         initial: list[float] = None,
         vel_mean_diff: list[float] = None,
         log_vel_sig_diff: list[float] = None,
+        vel_mean_min: list = None,
+        vel_mean_max: list = None,
         log_vel_sig_min: list = None,
         log_vel_sig_max: list = None,
         log_amp_lim=[0, 5],
@@ -290,28 +395,33 @@ class SpecLine:
         Parameters
         ----------
 
-        vel_mean_mu, vel_mean_sig : list[float]
-            means/standard deviations of the velocity priors
+        vel_mean_mu, vel_mean_sig : list[float], optional
+            means/standard deviations of the Gaussian velocity priors. Mutually
+            exclusive with vel_mean_min/vel_mean_max
 
-        log_vel_sig_mu, log_vel_sig_sig : list[float]
-            means/standard deviations of the logarithmic velocity dispersion priors
+        log_vel_sig_mu, log_vel_sig_sig : list[float], optional
+            means/standard deviations of the Gaussian logarithmic velocity dispersion priors.
+            Mutually exclusive with log_vel_sig_min/log_vel_sig_max
 
         initial : array_like, optional
              initial values for the MCMC sampler
                 if not provided, the initial values will be set to the least square estimation
 
         vel_mean_diff : array_like, optional
-            standard deviations of the difference between velocity components
-            list of tuples - (j, k, v_diff) : Var(v_j - v_k) = v_diff**2
+            Gaussian priors on selected velocity-component differences
+            list of tuples - (j, k, v_diff) : v_j - v_k ~ Normal(0, v_diff)
 
         log_vel_sig_diff : array_like, optional
-            standard deviations of the difference between the logarithmic velocity dispersions
-            list of tuples - (j, k, log_v_sig_diff) : Var(log_v_sig_j - log_v_sig_k) = log_v_sig_diff**2
+            Gaussian priors on selected logarithmic velocity-dispersion differences
+            list of tuples - (j, k, log_v_sig_diff) : log_v_sig_j - log_v_sig_k ~ Normal(0, log_v_sig_diff)
+
+        vel_mean_min, vel_mean_max : array_like, optional
+            lower/upper bounds for velocity means. If provided, use bounded flat priors
+            instead of Gaussian priors
 
         log_vel_sig_min, log_vel_sig_max : array_like, optional
-            minimum/maximum logarithmic velocity dispersions
-                if not None, a softplux function will be added the posterior to punish velocity
-                dispersions greater than this value
+            lower/upper bounds for logarithmic velocity dispersions. If provided, use
+            bounded flat priors instead of Gaussian priors
 
         log_amp_lim : float, default=[-1e5, 1e5]
             allowed range of the log_amplitude
@@ -368,56 +478,42 @@ class SpecLine:
             log_amp = pm.Uniform("log_amp", lower=log_amp_lim[0], upper=log_amp_lim[1], shape=(n_lines,))
             amp = pm.Deterministic("amp", 10**log_amp)
 
-            if (len(vel_mean_mu) == n_lines) and (len(log_vel_sig_mu) == n_lines):
-                # optional priors
-                vel_mean_diff = [] if vel_mean_diff is None else vel_mean_diff
-                log_vel_sig_diff = [] if log_vel_sig_diff is None else log_vel_sig_diff
+            vel_mean_diff = _validate_pairwise_diff_constraints(vel_mean_diff, n_lines, "vel_mean_diff")
+            log_vel_sig_diff = _validate_pairwise_diff_constraints(log_vel_sig_diff, n_lines, "log_vel_sig_diff")
 
-                # mean velocity
-                vel_mean_cov = np.diag(vel_mean_sig) ** 2  # covariance matrix
-                for j, k, mean_diff in vel_mean_diff:
-                    vel_mean_cov[j, k] = vel_mean_cov[k, j] = (
-                        vel_mean_sig[j] ** 2 + vel_mean_sig[k] ** 2 - mean_diff**2
-                    ) / 2
-                if np.any(np.linalg.eigvals(vel_mean_cov) < 0):
-                    raise ValueError("Covariance matrix not positive semi-definite!")
-                v_mean = pm.MvNormal("v_mean", mu=vel_mean_mu, cov=vel_mean_cov)
-
-                # velocity dispersion
-                log_vel_sig_cov = np.diag(log_vel_sig_sig) ** 2  # covariance matrix
-                for j, k, log_sig_diff in log_vel_sig_diff:
-                    log_vel_sig_cov[j, k] = log_vel_sig_cov[k, j] = (
-                        log_vel_sig_sig[j] ** 2 + log_vel_sig_sig[k] ** 2 - log_sig_diff**2
-                    ) / 2
-                log_v_sig = pm.MvNormal(
-                    "log_v_sig",
-                    mu=log_vel_sig_mu,
-                    cov=log_vel_sig_cov,
-                )
-
-                # velocity dispersion limits
-                if log_vel_sig_min is not None:
-                    if len(log_vel_sig_min) != len(log_vel_sig_mu):
-                        raise IndexError(
-                            f"The number of the velocity priors {len(log_vel_sig_min)} does not match the number of lines {len(log_vel_sig_mu)}"
-                        )
-                    print("There is a vel_sig_min lim...")
-                    pm.Potential(
-                        "vel_sig_min_lim",
-                        -pm.math.log1pexp(-(log_v_sig - log_vel_sig_min) * 5**2),
-                    )
-                if log_vel_sig_max is not None:
-                    if len(log_vel_sig_max) != len(log_vel_sig_mu):
-                        raise IndexError(
-                            f"The number of the velocity priors {len(log_vel_sig_max)} does not match the number of lines {len(log_vel_sig_mu)}"
-                        )
-                    print("There is a vel_sig_max lim...")
-                    pm.Potential(
-                        "vel_sig_max_lim",
-                        -pm.math.log1pexp((log_v_sig - log_vel_sig_max) * 5**2),
-                    )
+            # mean velocity
+            prior_type, prior_a, prior_b = _validate_prior_inputs(
+                vel_mean_mu,
+                vel_mean_sig,
+                vel_mean_min,
+                vel_mean_max,
+                n_lines,
+                "vel_mean",
+            )
+            if prior_type == "uniform":
+                vel_mean_min, vel_mean_max = prior_a, prior_b
+                v_mean = pm.Uniform("v_mean", lower=vel_mean_min, upper=vel_mean_max, shape=(n_lines,))
             else:
-                raise IndexError("The number of the velocity priors does not match the number of lines")
+                vel_mean_mu, vel_mean_sig = prior_a, prior_b
+                v_mean = pm.Normal("v_mean", mu=vel_mean_mu, sigma=vel_mean_sig, shape=(n_lines,))
+            _add_pairwise_diff_potentials(v_mean, vel_mean_diff, "v_mean")
+
+            # velocity dispersion
+            prior_type, prior_a, prior_b = _validate_prior_inputs(
+                log_vel_sig_mu,
+                log_vel_sig_sig,
+                log_vel_sig_min,
+                log_vel_sig_max,
+                n_lines,
+                "log_vel_sig",
+            )
+            if prior_type == "uniform":
+                log_vel_sig_min, log_vel_sig_max = prior_a, prior_b
+                log_v_sig = pm.Uniform("log_v_sig", lower=log_vel_sig_min, upper=log_vel_sig_max, shape=(n_lines,))
+            else:
+                log_vel_sig_mu, log_vel_sig_sig = prior_a, prior_b
+                log_v_sig = pm.Normal("log_v_sig", mu=log_vel_sig_mu, sigma=log_vel_sig_sig, shape=(n_lines,))
+            _add_pairwise_diff_potentials(log_v_sig, log_vel_sig_diff, "log_v_sig")
 
             pm.Deterministic("v_sig", 10**log_v_sig)
             theta = []
@@ -491,7 +587,7 @@ class SpecLine:
             start["fl_red"] = self.fl_red
             start["v_mean"] = initial[2 * len(self.line_regions) :: 3]
             start["log_v_sig"] = initial[2 * len(self.line_regions) + 1 :: 3]
-            start["amp"] = initial[2 * len(self.line_regions) + 2 :: 3]
+            start["log_amp"] = initial[2 * len(self.line_regions) + 2 :: 3]
             # start["sigma_0"] = 1e-3
             for k, free in enumerate(self.free_rel_strength):
                 if free:
@@ -792,7 +888,7 @@ class SpecLine:
         else:
             plt.show()
 
-    def get_flux_at_lambda(self, lambda_0, delta_l=None):
+    def get_flux_at_lambda(self, lambda_0, delta_l=None, spec_resolution=None):
         """Get the flux and uncertainty at some given wavelength
 
         Returns the mean and uncertainty of flux in the
@@ -806,35 +902,62 @@ class SpecLine:
         delta_l : float, default=50
             the size of the wavelength interval [angstrom]
 
+        spec_resolution : float, optional
+            spectral FWHM resolution in Angstrom. If provided and positive, the
+            uncertainty of the weighted mean is inflated so oversampled pixels do
+            not count as independent measurements within one resolution element.
+
         Returns
         -------
         mean : float
             mean flux around the central wavelength
 
         std : float
-            multiple measurements:
-                standard deviation in flux around the central wavelength
-            single measurement:
-                flux uncertainty given
+            prior uncertainty for the local continuum flux, combining the formal
+            weighted-mean uncertainty and robust local scatter after accounting
+            for the number of independent FWHM resolution elements in the bin
         """
 
         if delta_l == None:
-            delta_l = self.spec_resolution * 3
-        region = np.where(np.abs(self.wv_rf - lambda_0) < delta_l)[0]
+            if spec_resolution is not None and spec_resolution > 0:
+                delta_l = spec_resolution * 3
+            else:
+                delta_l = 50
+
+        in_region = np.abs(self.wv_rf - lambda_0) < delta_l
+        for mk in self.mask:
+            in_region &= (self.wv_rf < mk[0]) | (self.wv_rf > mk[1])
+        valid = np.isfinite(self.wv_rf) & np.isfinite(self.fl) & np.isfinite(self.fl_unc) & (self.fl_unc > 0)
+        region = np.where(in_region & valid)[0]
         try:
             if len(region) == 0:
                 raise IndexError("No data within this range!")
-            elif len(region) == 1:
-                warnings.warn("Too few points within the wavelength range!")
-                return (self.fl[region[0]], self.fl_unc[region[0]])
             else:
-                mean = np.sum(self.fl[region] / self.fl_unc[region] ** 2) / np.sum(1 / self.fl_unc[region] ** 2)
+                wv_region = self.wv_rf[region]
+                fl_region = self.fl[region]
+                fl_unc_region = self.fl_unc[region]
+                ivar = 1 / fl_unc_region**2
+                sum_ivar = np.sum(ivar)
+                mean = np.sum(fl_region * ivar) / sum_ivar
+
+                sigma_mean_ind = 1 / np.sqrt(sum_ivar)
+                n_eff_weight = sum_ivar**2 / np.sum(ivar**2)
+                n_eff = n_eff_weight
+                if spec_resolution is not None and spec_resolution > 0 and len(region) > 1:
+                    bin_width = np.nanmax(wv_region) - np.nanmin(wv_region)
+                    n_eff_res = max(bin_width / spec_resolution, 1.0)
+                    n_eff = min(n_eff_weight, n_eff_res)
+
+                sigma_mean = sigma_mean_ind * np.sqrt(n_eff_weight / n_eff)
                 from astropy.stats import mad_std
 
-                std = mad_std(self.fl[region])
+                scatter = mad_std(fl_region)
+                if not np.isfinite(scatter):
+                    scatter = 0.0
+                sigma_scatter = scatter / np.sqrt(n_eff)
+                std = max(sigma_mean, sigma_scatter)
                 if len(region) <= 5:
                     warnings.warn("<=5 points within the wavelength range!")
-                    std = np.nanmedian(self.fl_unc[region])
 
                 # std = np.nanmin(self.fl_unc[region])
                 # std = np.std(self.fl[region], ddof=1)

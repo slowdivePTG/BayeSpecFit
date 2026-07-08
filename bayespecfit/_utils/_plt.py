@@ -9,7 +9,7 @@ plt.rcParams.update(
     {
         "text.usetex": True,
         "font.family": "sans-serif",
-        "font.sans-serif": "Helvetica",
+        "font.sans-serif": "Ariel",
         "font.size": 20,
         "xtick.labelsize": 20,
         "ytick.labelsize": 20,

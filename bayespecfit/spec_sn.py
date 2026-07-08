@@ -73,14 +73,15 @@ class SpectrumSN:
         snr : float, default=None
             the assigned S/N for spectra with no flux errors
 
-        spec_resolution : float, default=5
-            the spectral resolution of the spectrum in Angstrom
+        spec_resolution : float, default=None
+            spectral FWHM resolution of the spectrum in Angstrom. If None,
+            assume infinite spectral resolution.
 
         force_pos_flux : bool, default=False
             remove all the non-positive flux measurements
         """
 
-        spec_df = pd.read_csv(spec1D, comment="#", delim_whitespace=True, header=None)
+        spec_df = pd.read_csv(spec1D, comment="#", sep=r"\s+", header=None)
 
         wv = spec_df[0].values
         wv_rf = wv / (1 + z)
@@ -102,11 +103,14 @@ class SpectrumSN:
                 * (np.where(fl > np.nanmedian(fl) / 10, fl, np.nanmedian(fl) / 10) / np.nanmedian(fl)) ** -0.5
             )
 
-        # make sure flux measurements are positive
-        pos_flux = (fl > 0) | (force_pos_flux)
-        self.fl = fl[pos_flux]
-        self.wv_rf = wv_rf[pos_flux]
-        self.fl_unc = fl_unc[pos_flux]
+        # optionally require positive flux measurements
+        if force_pos_flux:
+            keep_flux = fl > 0
+        else:
+            keep_flux = np.ones_like(fl, dtype=bool)
+        self.fl = fl[keep_flux]
+        self.wv_rf = wv_rf[keep_flux]
+        self.fl_unc = fl_unc[keep_flux]
 
         # self.snr = snr
         if spec_resolution == None:
