@@ -63,6 +63,29 @@ def _add_pairwise_diff_potentials(values, diff_constraints, name: str):
         )
 
 
+def _calc_oversampling_sigma_scale(wv: ArrayLike, line_regions: list[tuple], spec_resolution: ArrayLike) -> NDArray:
+    """Estimate per-pixel sigma inflation for oversampled spectra."""
+
+    wv = np.asarray(wv, dtype=float)
+    spec_resolution = np.asarray(spec_resolution, dtype=float)
+    sigma_scale = np.ones_like(wv, dtype=float)
+
+    for edge, resolution in zip(line_regions, spec_resolution):
+        if not np.isfinite(resolution) or resolution <= 0:
+            continue
+
+        in_region = (wv > edge[0]) & (wv < edge[1])
+        wv_region = np.sort(wv[in_region])
+        if len(wv_region) <= 1:
+            continue
+
+        spacing = np.nanmedian(np.diff(wv_region))
+        if np.isfinite(spacing) and spacing > 0:
+            sigma_scale[in_region] = np.sqrt(max(resolution / spacing, 1.0))
+
+    return sigma_scale
+
+
 def _validate_prior_bounds(lower, upper, n_lines: int, name: str):
     """Validate lower/upper bounds for bounded flat priors."""
 
@@ -226,19 +249,11 @@ class SpecLine:
         # normalized flux; masked regions do not set the normalization scale
         self._fl_med = np.nanmedian(fl_line[in_unmasked_region])
         fl_norm = fl_line / self._fl_med
-        fl_norm_unc = fl_unc_line / self._fl_med
-
-        # check if there are points with relative uncertainty
-        # two orders of magnitude lower than the median
-        rel_unc = fl_norm_unc / fl_norm
-        rel_unc_fit = rel_unc[in_unmasked_region]
-        med_rel_unc = np.nanmedian(rel_unc_fit)
-        if rel_unc_fit.min() < med_rel_unc / 1e2:
-            warnings.warn("Some flux with extremely low uncertainty!")
-            rel_unc[(rel_unc < med_rel_unc / 1e2) & in_unmasked_region] = med_rel_unc
-            warnings.warn("New uncertainty assigned!")
-
-        fl_norm_unc = rel_unc * fl_norm
+        fl_norm_unc = fl_unc_line / np.abs(self._fl_med)
+        valid_fl_unc = np.isfinite(fl_norm_unc) & (fl_norm_unc > 0)
+        if not np.any(valid_fl_unc[in_unmasked_region]):
+            warnings.warn("No finite positive flux uncertainties in the fitted region; relying on the noise-floor likelihood term.")
+        fl_norm_unc = np.where(valid_fl_unc, fl_norm_unc, 0.0)
 
         self.fl_norm = fl_norm[in_unmasked_region]
         self.fl_norm_unmasked = fl_norm
@@ -252,6 +267,11 @@ class SpecLine:
             self.spec_resolution = np.ones(len(self.line_regions)) * spec_resolution
         else:
             self.spec_resolution = spec_resolution
+        self.oversampling_sigma_scale = _calc_oversampling_sigma_scale(
+            self.wv_line,
+            self.line_regions,
+            self.spec_resolution,
+        )
         # spectral resolution to velocity resolution
         self.vel_resolution = []
         # estimated flux at each edge (used as the initial guess & prior)
@@ -384,8 +404,10 @@ class SpecLine:
         log_vel_sig_min: list = None,
         log_vel_sig_max: list = None,
         log_amp_lim=[0, 5],
+        noise_floor_scale: Optional[float] = None,
         sampler="NUTS",
         nburn=2000,
+        chains=4,
         target_accept=0.8,
         plot_structure=False,
         plot_mcmc=False,
@@ -426,6 +448,11 @@ class SpecLine:
         log_amp_lim : float, default=[-1e5, 1e5]
             allowed range of the log_amplitude
 
+        noise_floor_scale : float, optional
+            Half-normal prior scale for the additive normalized-flux noise floor.
+            If not provided, use the median finite positive measurement uncertainty;
+            if no measurement uncertainties are available, use 1.0.
+
         sampler : ['NUTS', 'MH'], default='NUTS'
             amp step function or collection of functions
                 'NUTS' : The No-U-Turn Sampler
@@ -433,6 +460,10 @@ class SpecLine:
 
         nburn : int, default=2000
             number of "burn-in" steps for the MCMC chains
+
+        chains : int, default=4
+            number of MCMC chains
+
 
         target_accept : float in [0, 1], default=0.8
             the step size is tuned such that we approximate this acceptance rate
@@ -564,12 +595,17 @@ class SpecLine:
                 ),
             )
 
-            # uncertainty normalization
-            # typical_unc = np.median(self.fl_norm_unc)
-            # sigma_0 = pm.HalfCauchy("sigma_0", beta=typical_unc)
-            # sigma = pm.Deterministic("sigma", (sigma_0**2 + self.fl_norm_unc**2) ** 0.5)
+            measurement_sigma = self.fl_norm_unc * self.oversampling_sigma_scale
+            if noise_floor_scale is None:
+                valid_sigma = measurement_sigma[np.isfinite(measurement_sigma) & (measurement_sigma > 0)]
+                noise_floor_prior_scale = np.nanmedian(valid_sigma) if len(valid_sigma) else 1.0
+            else:
+                noise_floor_prior_scale = noise_floor_scale
+            if not np.isfinite(noise_floor_prior_scale) or noise_floor_prior_scale <= 0:
+                raise ValueError("noise_floor_scale must be positive and finite")
 
-            sigma = self.fl_norm_unc
+            noise_floor = pm.HalfNormal("noise_floor", sigma=noise_floor_prior_scale)
+            sigma = pm.Deterministic("sigma", pt.sqrt(measurement_sigma**2 + noise_floor**2))
 
             pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.fl_norm)
 
@@ -588,7 +624,6 @@ class SpecLine:
             start["v_mean"] = initial[2 * len(self.line_regions) :: 3]
             start["log_v_sig"] = initial[2 * len(self.line_regions) + 1 :: 3]
             start["log_amp"] = initial[2 * len(self.line_regions) + 2 :: 3]
-            # start["sigma_0"] = 1e-3
             for k, free in enumerate(self.free_rel_strength):
                 if free:
                     start[f"ratio_{k}"] = self.rel_strength[k]
@@ -599,6 +634,7 @@ class SpecLine:
                 trace = pm.sample(
                     return_inferencedata=True,
                     initvals=start,
+                    chains=chains,
                     target_accept=target_accept,
                     tune=nburn,
                 )
@@ -606,6 +642,7 @@ class SpecLine:
                 trace = pm.sample(
                     return_inferencedata=True,
                     initvals=start,
+                    chains=chains,
                     step=pm.Metropolis(),
                     tune=nburn,
                 )
@@ -927,8 +964,8 @@ class SpecLine:
         in_region = np.abs(self.wv_rf - lambda_0) < delta_l
         for mk in self.mask:
             in_region &= (self.wv_rf < mk[0]) | (self.wv_rf > mk[1])
-        valid = np.isfinite(self.wv_rf) & np.isfinite(self.fl) & np.isfinite(self.fl_unc) & (self.fl_unc > 0)
-        region = np.where(in_region & valid)[0]
+        valid_flux = np.isfinite(self.wv_rf) & np.isfinite(self.fl)
+        region = np.where(in_region & valid_flux)[0]
         try:
             if len(region) == 0:
                 raise IndexError("No data within this range!")
@@ -936,12 +973,20 @@ class SpecLine:
                 wv_region = self.wv_rf[region]
                 fl_region = self.fl[region]
                 fl_unc_region = self.fl_unc[region]
-                ivar = 1 / fl_unc_region**2
-                sum_ivar = np.sum(ivar)
-                mean = np.sum(fl_region * ivar) / sum_ivar
+                valid_unc = np.isfinite(fl_unc_region) & (fl_unc_region > 0)
+                if np.any(valid_unc):
+                    fl_fit = fl_region[valid_unc]
+                    fl_unc_fit = fl_unc_region[valid_unc]
+                    ivar = 1 / fl_unc_fit**2
+                    sum_ivar = np.sum(ivar)
+                    mean = np.sum(fl_fit * ivar) / sum_ivar
+                    sigma_mean_ind = 1 / np.sqrt(sum_ivar)
+                    n_eff_weight = sum_ivar**2 / np.sum(ivar**2)
+                else:
+                    mean = np.nanmean(fl_region)
+                    sigma_mean_ind = 0.0
+                    n_eff_weight = len(region)
 
-                sigma_mean_ind = 1 / np.sqrt(sum_ivar)
-                n_eff_weight = sum_ivar**2 / np.sum(ivar**2)
                 n_eff = n_eff_weight
                 if spec_resolution is not None and spec_resolution > 0 and len(region) > 1:
                     bin_width = np.nanmax(wv_region) - np.nanmin(wv_region)
@@ -956,6 +1001,8 @@ class SpecLine:
                     scatter = 0.0
                 sigma_scatter = scatter / np.sqrt(n_eff)
                 std = max(sigma_mean, sigma_scatter)
+                if not np.isfinite(std) or std <= 0:
+                    std = max(np.abs(mean), 1.0) * np.finfo(float).eps
                 if len(region) <= 5:
                     warnings.warn("<=5 points within the wavelength range!")
 
@@ -1013,7 +1060,7 @@ class SpecLine:
 ###################### Likelihood ##########################
 
 
-def lnlike_gaussian_abs(theta, spec_line: SpecLine, flux_at_edge: bool = False) -> float:
+def lnlike_gaussian_abs(theta, spec_line: SpecLine, flux_at_edge: bool = False, noise_floor: float = 0.0) -> float:
     """Log likelihood function assuming Gaussian profile
 
     Parameters
@@ -1031,6 +1078,10 @@ def lnlike_gaussian_abs(theta, spec_line: SpecLine, flux_at_edge: bool = False) 
     flux_edge : bool, default=False
         whether the theta contains the flux at the blue and red edges
         if not, use the prior (i.e., the flux measured right at the edges)
+
+    noise_floor : float, default=0.0
+        additive normalized-flux noise floor used in quadrature with the
+        oversampling-rescaled measurement uncertainties
 
     Returns
     -------
@@ -1061,10 +1112,14 @@ def lnlike_gaussian_abs(theta, spec_line: SpecLine, flux_at_edge: bool = False) 
         vel_resolution=spec_line.vel_resolution,
         model=spec_line.line_model,
     )
+    sigma = np.sqrt((spec_line.fl_norm_unc * spec_line.oversampling_sigma_scale) ** 2 + noise_floor**2)
+    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0):
+        return -np.inf
+
     lnl = (
         -0.5 * len(model_flux) * np.log(2 * np.pi)
-        - np.sum(np.log(spec_line.fl_norm_unc))
-        - 0.5 * np.sum((spec_line.fl_norm - model_flux) ** 2 / spec_line.fl_norm_unc**2)
+        - np.sum(np.log(sigma))
+        - 0.5 * np.sum((spec_line.fl_norm - model_flux) ** 2 / sigma**2)
     )
 
     return lnl

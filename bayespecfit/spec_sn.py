@@ -88,19 +88,18 @@ class SpectrumSN:
         ALambda = calALambda(wv, RV=3.1, EBV=ebv)
         fl = spec_df[1].values * 10 ** (0.4 * ALambda)
 
-        if snr == None:
-            try:
+        if snr is None:
+            if spec_df.shape[1] >= 3:
                 fl_unc = spec_df[2].values * 10 ** (0.4 * ALambda)
-            except:
-                warnings.warn("No flux uncertainty in the datafile!")
-                warnings.warn(f"Please assign the S/N manually.")
+            else:
+                raise ValueError("No flux uncertainty in the datafile; pass snr to assign uncertainties.")
         else:
-            # the same uncertainty is assigned to all the flux measurements
             warnings.warn("snr = {:.1f} assigned.".format(snr))
+            fl_floor = np.nanmedian(fl) / 10
             fl_unc = (
                 np.ones_like(fl)
                 * (np.nanmedian(fl) / snr)
-                * (np.where(fl > np.nanmedian(fl) / 10, fl, np.nanmedian(fl) / 10) / np.nanmedian(fl)) ** -0.5
+                * (np.where(fl > fl_floor, fl, fl_floor) / np.nanmedian(fl)) ** -0.5
             )
 
         # optionally require positive flux measurements
@@ -112,7 +111,6 @@ class SpectrumSN:
         self.wv_rf = wv_rf[keep_flux]
         self.fl_unc = fl_unc[keep_flux]
 
-        # self.snr = snr
         if spec_resolution == None:
             warnings.warn("The spectral resolution is not provided: assume infinite resolution.")
             self.spec_resolution = 0
