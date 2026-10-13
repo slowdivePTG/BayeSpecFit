@@ -8,6 +8,7 @@ import arviz as az
 import corner
 
 import warnings
+from scipy.special import gammaln
 
 from .tools.data_binning import data_binning
 from .flux_model import velocity_rf, calc_model_flux
@@ -24,7 +25,7 @@ SPEED_OF_LIGHT = 2.99792458e5
 
 
 def _validate_pairwise_diff_constraints(diff_constraints, n_lines: int, name: str) -> list[tuple[int, int, float]]:
-    """Validate pairwise prior widths for component differences."""
+    """Validate Gaussian prior widths for component differences."""
 
     if diff_constraints is None:
         return []
@@ -53,6 +54,69 @@ def _validate_pairwise_diff_constraints(diff_constraints, n_lines: int, name: st
     return validated
 
 
+def _validate_ordering_constraints(order_constraints, n_lines: int, name: str) -> list[tuple[int, int, float]]:
+    """Validate one-sided ordering constraints.
+
+    Each constraint ``(j, k, sigma)`` enforces v[j] <= v[k] (component ``j``
+    more blue-shifted than ``k``) through a soft half-Gaussian penalty on any
+    positive difference, of width ``sigma``. No hard bounds are imposed.
+    """
+
+    if order_constraints is None:
+        return []
+
+    validated = []
+    seen = set()
+    for constraint in order_constraints:
+        if len(constraint) != 3:
+            raise ValueError(f"{name} entries must be (j, k, sigma) tuples")
+        j, k, sigma = constraint
+        if not isinstance(j, (int, np.integer)) or not isinstance(k, (int, np.integer)):
+            raise TypeError(f"{name} indices must be integers")
+        if j == k:
+            raise ValueError(f"{name} cannot constrain a component to itself: ({j}, {k})")
+        if j < 0 or k < 0 or j >= n_lines or k >= n_lines:
+            raise IndexError(f"{name} indices ({j}, {k}) are out of range for {n_lines} line components")
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(f"{name} sigma for pair ({j}, {k}) must be positive and finite")
+
+        pair = (int(j), int(k))
+        if pair in seen:
+            raise ValueError(f"Duplicate {name} constraint for pair {pair}")
+        seen.add(pair)
+        validated.append((int(j), int(k), float(sigma)))
+
+    return validated
+
+
+def _validate_vel_mean_prior(prior, n_lines: int):
+    """Validate per-component extra Gaussian velocity priors.
+
+    ``prior`` is a length-``n_lines`` sequence whose entries are either ``None``
+    (component keeps only its default prior) or ``(mu, sigma)`` tuples for an
+    additional Gaussian factor on that component's velocity.
+    """
+
+    if prior is None:
+        return None
+
+    if len(prior) != n_lines:
+        raise IndexError(f"vel_mean_prior must have length {n_lines}")
+
+    validated = []
+    for entry in prior:
+        if entry is None:
+            validated.append(None)
+            continue
+        if len(entry) != 2:
+            raise ValueError("vel_mean_prior entries must be None or (mu, sigma) tuples")
+        mu, sigma = entry
+        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError("vel_mean_prior mu must be finite and sigma positive")
+        validated.append((float(mu), float(sigma)))
+    return validated
+
+
 def _add_pairwise_diff_potentials(values, diff_constraints, name: str):
     """Add Gaussian priors on selected pairwise differences."""
 
@@ -61,6 +125,22 @@ def _add_pairwise_diff_potentials(values, diff_constraints, name: str):
             f"{name}_diff_{j}_{k}",
             pm.logp(pm.Normal.dist(mu=0, sigma=sigma), values[j] - values[k]),
         )
+
+
+def _add_ordering_potentials(values, order_constraints, name: str):
+    """Add a soft one-sided ordering penalty v[j] <= v[k].
+
+    The penalty acts only when v[j] - v[k] > 0 (wrong order) and is a
+    half-Gaussian of width ``sigma`` in that regime; correctly ordered draws
+    cost nothing. This keeps the ordering in the prior without imposing hard,
+    disjoint velocity bounds on the components.
+    """
+
+    for j, k, sigma in order_constraints:
+        wrong_order = pt.maximum(values[j] - values[k], 0.0)
+        logp = -0.5 * (wrong_order / sigma) ** 2
+        pm.Potential(f"{name}_order_{j}_{k}", logp)
+
 
 
 def _calc_oversampling_sigma_scale(wv: ArrayLike, line_regions: list[tuple], spec_resolution: ArrayLike) -> NDArray:
@@ -394,10 +474,12 @@ class SpecLine:
         self,
         vel_mean_mu: Optional[list[float]] = None,
         vel_mean_sig: Optional[list[float]] = None,
+        vel_mean_prior: Optional[list] = None,
         log_vel_sig_mu: Optional[list[float]] = None,
         log_vel_sig_sig: Optional[list[float]] = None,
         initial: list[float] = None,
         vel_mean_diff: list[float] = None,
+        vel_mean_order: list[float] = None,
         log_vel_sig_diff: list[float] = None,
         vel_mean_min: list = None,
         vel_mean_max: list = None,
@@ -408,9 +490,16 @@ class SpecLine:
         sampler="NUTS",
         nburn=2000,
         chains=4,
+        draws=1000,
         target_accept=0.8,
+        random_seed=None,
+        init="jitter+adapt_diag",
+        initvals=None,
         plot_structure=False,
         plot_mcmc=False,
+        likelihood="StudentT",
+        student_t_nu=4.0,
+        use_noise_floor=False,
     ) -> tuple[InferenceData, Model]:
         """MCMC sampler with pymc
 
@@ -420,6 +509,12 @@ class SpecLine:
         vel_mean_mu, vel_mean_sig : list[float], optional
             means/standard deviations of the Gaussian velocity priors. Mutually
             exclusive with vel_mean_min/vel_mean_max
+
+        vel_mean_prior : list[Optional[tuple]], optional
+            extra per-component Gaussian priors ``(mu, sigma)`` multiplied on
+            top of each component's existing velocity prior. Entries may be
+            ``None`` for components that should keep only their default prior.
+            Used e.g. to tie a Ca II PVF component to a Si II velocity.
 
         log_vel_sig_mu, log_vel_sig_sig : list[float], optional
             means/standard deviations of the Gaussian logarithmic velocity dispersion priors.
@@ -432,6 +527,14 @@ class SpecLine:
         vel_mean_diff : array_like, optional
             Gaussian priors on selected velocity-component differences
             list of tuples - (j, k, v_diff) : v_j - v_k ~ Normal(0, v_diff)
+
+        vel_mean_order : array_like, optional
+            Soft one-sided ordering priors on velocity components.
+            list of tuples - (j, k, sigma) : enforces v_j <= v_k (component j
+            more blue-shifted than k) via a half-Gaussian penalty of width
+            ``sigma`` applied only when v_j - v_k > 0. This keeps the ordering
+            in the prior without imposing hard, disjoint velocity bounds on the
+            components; each component keeps its own (wide) range.
 
         log_vel_sig_diff : array_like, optional
             Gaussian priors on selected logarithmic velocity-dispersion differences
@@ -464,13 +567,38 @@ class SpecLine:
         chains : int, default=4
             number of MCMC chains
 
+        draws : int, default=1000
+            number of posterior draws per chain
+
 
         target_accept : float in [0, 1], default=0.8
             the step size is tuned such that we approximate this acceptance rate
             higher values like 0.9 or 0.95 often work better for problematic posteriors
 
+        random_seed : int or sequence, optional
+            Seed(s) passed to PyMC for reproducible sampling.
+
+        init : str, default="jitter+adapt_diag"
+            PyMC initialization strategy.
+
+        initvals : dict or sequence of dict, optional
+            Initial values for one or more chains. A sequence supplies
+            chain-specific starting values.
+
         plot_mcmc : bool, default=False
             whether to plot the MCMC chains and corner plots
+
+        likelihood : {"StudentT", "Normal"}, default="StudentT"
+            Observation model for the normalized flux values. The Student-t
+            model uses a fixed degrees-of-freedom parameter.
+
+        student_t_nu : float, default=4
+            Fixed degrees of freedom for the Student-t observation model.
+
+        use_noise_floor : bool, default=False
+            Whether to include a global additive normalized-flux noise floor
+            in quadrature with the measurement uncertainties. This should be
+            enabled only when the input spectrum has no uncertainty column.
 
         Returns
         -------
@@ -510,6 +638,8 @@ class SpecLine:
             amp = pm.Deterministic("amp", 10**log_amp)
 
             vel_mean_diff = _validate_pairwise_diff_constraints(vel_mean_diff, n_lines, "vel_mean_diff")
+            vel_mean_order = _validate_ordering_constraints(vel_mean_order, n_lines, "vel_mean_order")
+            vel_mean_prior = _validate_vel_mean_prior(vel_mean_prior, n_lines)
             log_vel_sig_diff = _validate_pairwise_diff_constraints(log_vel_sig_diff, n_lines, "log_vel_sig_diff")
 
             # mean velocity
@@ -528,6 +658,16 @@ class SpecLine:
                 vel_mean_mu, vel_mean_sig = prior_a, prior_b
                 v_mean = pm.Normal("v_mean", mu=vel_mean_mu, sigma=vel_mean_sig, shape=(n_lines,))
             _add_pairwise_diff_potentials(v_mean, vel_mean_diff, "v_mean")
+            _add_ordering_potentials(v_mean, vel_mean_order, "v_mean")
+            if vel_mean_prior is not None:
+                for k, entry in enumerate(vel_mean_prior):
+                    if entry is None:
+                        continue
+                    mu_k, sigma_k = entry
+                    pm.Potential(
+                        f"v_mean_gauss_{k}",
+                        pm.logp(pm.Normal.dist(mu=mu_k, sigma=sigma_k), v_mean[k]),
+                    )
 
             # velocity dispersion
             prior_type, prior_a, prior_b = _validate_prior_inputs(
@@ -601,13 +741,24 @@ class SpecLine:
                 noise_floor_prior_scale = np.nanmedian(valid_sigma) if len(valid_sigma) else 1.0
             else:
                 noise_floor_prior_scale = noise_floor_scale
-            if not np.isfinite(noise_floor_prior_scale) or noise_floor_prior_scale <= 0:
+            if use_noise_floor and (not np.isfinite(noise_floor_prior_scale) or noise_floor_prior_scale <= 0):
                 raise ValueError("noise_floor_scale must be positive and finite")
 
-            noise_floor = pm.HalfNormal("noise_floor", sigma=noise_floor_prior_scale)
-            sigma = pm.Deterministic("sigma", pt.sqrt(measurement_sigma**2 + noise_floor**2))
+            if likelihood not in {"StudentT", "Normal"}:
+                raise ValueError("likelihood must be 'StudentT' or 'Normal'")
+            if not np.isfinite(student_t_nu) or student_t_nu <= 0:
+                raise ValueError("student_t_nu must be positive and finite")
 
-            pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.fl_norm)
+            if use_noise_floor:
+                noise_floor = pm.HalfNormal("noise_floor", sigma=noise_floor_prior_scale)
+                sigma = pm.Deterministic("sigma", pt.sqrt(measurement_sigma**2 + noise_floor**2))
+            else:
+                sigma = pm.Deterministic("sigma", pt.as_tensor_variable(measurement_sigma))
+
+            if likelihood == "StudentT":
+                pm.StudentT("Flux", nu=student_t_nu, mu=mu, sigma=sigma, observed=self.fl_norm)
+            else:
+                pm.Normal("Flux", mu=mu, sigma=sigma, observed=self.fl_norm)
 
         if plot_structure:
             pm.model_to_graphviz(Profile)
@@ -632,21 +783,33 @@ class SpecLine:
         with Profile:
             if sampler == "NUTS":
                 trace = pm.sample(
+                    draws=draws,
                     return_inferencedata=True,
-                    initvals=start,
+                    init=init,
+                    initvals=start if initvals is None else initvals,
                     chains=chains,
                     target_accept=target_accept,
                     tune=nburn,
+                    random_seed=random_seed,
                 )
             elif sampler == "MH":
                 trace = pm.sample(
+                    draws=draws,
                     return_inferencedata=True,
-                    initvals=start,
+                    init=init,
+                    initvals=start if initvals is None else initvals,
                     chains=chains,
                     step=pm.Metropolis(),
                     tune=nburn,
+                    random_seed=random_seed,
                 )
         self.trace = trace
+        self.likelihood = likelihood
+        self.student_t_nu = float(student_t_nu)
+        self.use_noise_floor = bool(use_noise_floor)
+        self.noise_floor_prior_scale = (
+            float(noise_floor_prior_scale) if use_noise_floor else None
+        )
         var_names_summary = ["v_mean", "v_sig", "amp"]
         for k in ratio_index:
             var_names_summary.append(f"log_ratio_{k}")
@@ -1130,6 +1293,53 @@ def neg_lnlike_gaussian_abs(theta, spec_line, **kwargs):
 
     lnl = lnlike_gaussian_abs(theta, spec_line, **kwargs)
     return -lnl
+
+
+def lnlike_student_t_abs(
+    theta,
+    spec_line: SpecLine,
+    flux_at_edge: bool = False,
+    noise_floor: float = 0.0,
+    nu: float = 4.0,
+) -> float:
+    """Student-t log likelihood with fixed or supplied degrees of freedom."""
+
+    if not np.isfinite(nu) or nu <= 0:
+        raise ValueError("nu must be positive and finite")
+
+    if flux_at_edge:
+        theta0 = theta
+    else:
+        theta_cont = []
+        for k in range(len(spec_line.line_regions)):
+            theta_cont.append(spec_line.fl_blue[k])
+            theta_cont.append(spec_line.fl_red[k])
+        theta0 = np.append(theta_cont, theta)
+
+    params = spec_line.decode_theta(theta0)
+    log_ratio = params.pop("log_ratio")
+    model_flux = calc_model_flux(
+        **params,
+        wv_rf=spec_line.wv_line,
+        lines=spec_line.lines,
+        rel_strength=spec_line.get_rel_strength(log_ratio=log_ratio),
+        line_regions=spec_line.line_regions,
+        vel_resolution=spec_line.vel_resolution,
+        model=spec_line.line_model,
+    )
+    sigma = np.sqrt((spec_line.fl_norm_unc * spec_line.oversampling_sigma_scale) ** 2 + noise_floor**2)
+    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0):
+        return -np.inf
+
+    residual = (spec_line.fl_norm - model_flux) / sigma
+    log_norm = gammaln((nu + 1.0) / 2.0) - gammaln(nu / 2.0) - 0.5 * np.log(nu * np.pi)
+    return float(np.sum(log_norm - np.log(sigma) - ((nu + 1.0) / 2.0) * np.log1p(residual**2 / nu)))
+
+
+def neg_lnlike_student_t_abs(theta, spec_line, **kwargs):
+    """Negative Student-t log likelihood."""
+
+    return -lnlike_student_t_abs(theta, spec_line, **kwargs)
 
 # Add a debugging function to check shapes
 def debug_shapes(*args, names=None):

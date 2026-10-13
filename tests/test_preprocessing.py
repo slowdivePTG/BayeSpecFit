@@ -2,7 +2,7 @@ import warnings
 
 import numpy as np
 
-from bayespecfit.spec_line import SpecLine, lnlike_gaussian_abs
+from bayespecfit.spec_line import SpecLine, lnlike_gaussian_abs, lnlike_student_t_abs
 from bayespecfit.spec_sn import SpectrumSN
 
 
@@ -96,6 +96,26 @@ def test_noise_floor_allows_likelihood_without_measurement_uncertainties():
 
     assert lnlike_gaussian_abs(theta, line) == -np.inf
     assert np.isfinite(lnlike_gaussian_abs(theta, line, noise_floor=0.1))
+
+
+def test_student_t_likelihood_is_finite_and_robust_to_an_outlier():
+    wv = np.linspace(4990.0, 5010.0, 41)
+    fl = np.ones_like(wv)
+    fl[20] = 2.0
+    fl_unc = np.full_like(wv, 0.1)
+    line = SpecLine(
+        np.column_stack([wv, fl, fl_unc]),
+        lines=[5000.0],
+        line_regions=[(4990.0, 5010.0)],
+        spec_resolution=1.0,
+    )
+
+    theta = [0.0, 2.0, -2.0]
+    student_t = lnlike_student_t_abs(theta, line, nu=4.0)
+    gaussian = lnlike_gaussian_abs(theta, line)
+
+    assert np.isfinite(student_t)
+    assert student_t > gaussian
 
 
 def test_continuum_bin_excludes_masked_points():

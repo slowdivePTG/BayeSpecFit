@@ -92,7 +92,8 @@ class SpectrumSN:
             if spec_df.shape[1] >= 3:
                 fl_unc = spec_df[2].values * 10 ** (0.4 * ALambda)
             else:
-                raise ValueError("No flux uncertainty in the datafile; pass snr to assign uncertainties.")
+                warnings.warn("No flux uncertainty in the datafile; retaining NaN uncertainties.")
+                fl_unc = np.full_like(fl, np.nan, dtype=float)
         else:
             warnings.warn("snr = {:.1f} assigned.".format(snr))
             fl_floor = np.nanmedian(fl) / 10

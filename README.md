@@ -17,6 +17,15 @@ conda activate MY_ENV
 
 The default sampler is the No-U-Turn sampler embedded in `pymc`.
 
+## Flux likelihood
+
+`SpecLine.MCMC_sampler` uses a Student-t flux likelihood with fixed degrees of
+freedom `nu=4` by default. Measurement uncertainties are rescaled for spectral
+oversampling and combined in quadrature with a single global additive noise
+floor. The ZTF early-Ia workflow uses a `HalfNormal(0.1)` prior for this floor
+for every spectrum, including spectra with reported uncertainties, to account
+for model discrepancy.
+
 ## Installation (under developement)
 
 ```shell
@@ -24,4 +33,3 @@ git clone https://github.com/slowdivePTG/BayeSpecFit.git
 cd BayeSpecFit
 pip install -e .
 ```
-
